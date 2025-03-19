@@ -101,6 +101,9 @@ move-command-line-common.workspace = true
 move-cli.workspace = true
 move-symbol-pool.workspace = true
 
+rpassword.workspace = true
+dirs.workspace = true
+
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemalloc-ctl.workspace = true
 
