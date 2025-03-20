@@ -6,7 +6,7 @@ use crate::random_names::{random_name, random_names};
 use anyhow::{anyhow, bail, ensure, Context};
 use bip32::DerivationPath;
 use bip39::{Language, Mnemonic, Seed};
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{rngs::StdRng, SeedableRng, RngCore};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use shared_crypto::intent::{Intent, IntentMessage};
@@ -30,6 +30,7 @@ use std::num::NonZeroU32;
 use hex;
 use sui_types::crypto::DefaultHash;
 use sui_types::transaction::{Transaction, TransactionData};
+use fastcrypto::hash::HashFunction;
 
 /// Data structure for secure signing results using encrypted keystore
 #[derive(Serialize, Deserialize, Debug)]
