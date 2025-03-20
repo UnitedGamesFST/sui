@@ -333,45 +333,7 @@ impl AccountKeystore for FileBasedKeystore {
         old_alias: &str,
         new_alias: Option<&str>,
     ) -> Result<String, anyhow::Error> {
-        // Step 1: Find address
-        let addr_opt = {
-            let mut addr = None;
-            for (address, alias) in &self.aliases {
-                if alias.alias == old_alias {
-                    addr = Some(*address);
-                    break;
-                }
-            }
-            addr
-        };
-        
-        let address = match addr_opt {
-            Some(address) => address,
-            None => bail!("Cannot find an address for alias {old_alias}"),
-        };
-        
-        // Step 2: Set new alias
-        let new_alias_name = match new_alias {
-            Some(a) if self.alias_exists(a) && a != old_alias => {
-                bail!("Alias {a} already exists. Please choose another alias.")
-            }
-            Some(a) => validate_alias(a)?,
-            None => random_name(
-                &self
-                    .alias_names()
-                    .into_iter()
-                    .map(|x| x.to_string())
-                    .collect::<HashSet<_>>(),
-            ),
-        };
-        
-        // Step 3: Update
-        if let Some(alias_struct) = self.aliases.get_mut(&address) {
-            alias_struct.alias = new_alias_name.clone();
-        } else {
-            bail!("Cannot find an alias for address {address}");
-        }
-        
+        let new_alias_name = self.update_alias_value(old_alias, new_alias)?;
         self.save_aliases()?;
         Ok(new_alias_name)
     }
