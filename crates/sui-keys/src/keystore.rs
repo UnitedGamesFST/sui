@@ -6,7 +6,7 @@ use crate::random_names::{random_name, random_names};
 use anyhow::{anyhow, bail, ensure, Context};
 use bip32::DerivationPath;
 use bip39::{Language, Mnemonic, Seed};
-use rand::{rngs::StdRng, SeedableRng, RngCore};
+use rand::{rngs::StdRng, SeedableRng};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use shared_crypto::intent::{Intent, IntentMessage};
@@ -30,7 +30,6 @@ use std::num::NonZeroU32;
 use hex;
 use sui_types::crypto::DefaultHash;
 use sui_types::transaction::{Transaction, TransactionData};
-use fastcrypto::hash::HashFunction;
 
 /// Data structure for secure signing results using encrypted keystore
 #[derive(Serialize, Deserialize, Debug)]
@@ -404,46 +403,53 @@ impl FileBasedKeystore {
         aliases_path.set_extension("aliases");
 
         let aliases = if aliases_path.exists() {
-            let file = File::open(&aliases_path).with_context(|| {
+            let reader = BufReader::new(File::open(&aliases_path).with_context(|| {
                 format!(
-                    "Cannot open alias file at path: {}",
+                    "Cannot open aliases file in keystore: {}",
                     aliases_path.display()
                 )
-            })?;
-            
-            let reader = BufReader::new(file);
-            let alias_vec: Vec<Alias> = serde_json::from_reader(reader).with_context(|| {
+            })?);
+
+            let aliases: Vec<Alias> = serde_json::from_reader(reader).with_context(|| {
                 format!(
-                    "Cannot deserialize aliases from file: {}",
-                    aliases_path.display()
+                    "Cannot deserialize aliases file in keystore: {}",
+                    aliases_path.display(),
                 )
             })?;
 
-            // Convert alias information to BTreeMap
-            let mut aliases_map = BTreeMap::new();
-            for alias in alias_vec {
-                if let Ok(public_key) = PublicKey::decode_base64(&alias.public_key_base64) {
-                    let address: SuiAddress = (&public_key).into();
-                    aliases_map.insert(address, alias);
-                }
-            }
-            aliases_map
+            aliases
+                .into_iter()
+                .map(|alias| {
+                    let key = PublicKey::decode_base64(&alias.public_key_base64);
+                    key.map(|k| (Into::<SuiAddress>::into(&k), alias))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()
+                .map_err(|e| {
+                    anyhow!(
+                        "Invalid aliases file in keystore: {}. {}",
+                        aliases_path.display(),
+                        e
+                    )
+                })?
         } else if keys.is_empty() {
             BTreeMap::new()
         } else {
             let names: Vec<String> = random_names(HashSet::new(), keys.len());
-            let mut aliases_map = BTreeMap::new();
-            for ((sui_address, skp), alias) in keys.iter().zip(names) {
-                let public_key_base64 = skp.public().encode_base64();
-                aliases_map.insert(
-                    *sui_address,
-                    Alias {
-                        alias,
-                        public_key_base64,
-                    },
-                );
-            }
-            let aliases_store = serde_json::to_string_pretty(&aliases_map.values().collect::<Vec<_>>())
+            let aliases = keys
+                .iter()
+                .zip(names)
+                .map(|((sui_address, skp), alias)| {
+                    let public_key_base64 = skp.public().encode_base64();
+                    (
+                        *sui_address,
+                        Alias {
+                            alias,
+                            public_key_base64,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let aliases_store = serde_json::to_string_pretty(&aliases.values().collect::<Vec<_>>())
                 .with_context(|| {
                     format!(
                         "Cannot serialize aliases to file in keystore: {}",
@@ -451,7 +457,7 @@ impl FileBasedKeystore {
                     )
                 })?;
             fs::write(aliases_path, aliases_store)?;
-            aliases_map
+            aliases
         };
 
         Ok(Self {
