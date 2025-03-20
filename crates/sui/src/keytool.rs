@@ -42,7 +42,7 @@ use sui_keys::keypair_file::{
     read_authority_keypair_from_file, read_keypair_from_file, write_authority_keypair_to_file,
     write_keypair_to_file,
 };
-use sui_keys::keystore::{AccountKeystore, Keystore};
+use sui_keys::keystore::{AccountKeystore, SecureSignData, Keystore};
 use sui_types::base_types::SuiAddress;
 use sui_types::committee::EpochId;
 use sui_types::crypto::{
@@ -61,9 +61,8 @@ use tabled::builder::Builder;
 use tabled::settings::Rotate;
 use tabled::settings::{object::Rows, Modify, Width};
 use tracing::info;
-use sui_keys::keystore::{EncryptedFileBasedKeystore};
-use std::io;
-use std::io::Write;
+use std::io::{self, Write};
+use rpassword;
 #[cfg(test)]
 #[path = "unit_tests/keytool_tests.rs"]
 mod keytool_tests;
@@ -375,6 +374,30 @@ pub enum KeyToolCommand {
         #[clap(long, short = 's')]
         sort_by_alias: bool,
     },
+
+    /// Securely sign a transaction using an encrypted keystore
+    #[clap(name = "secure-sign")]
+    SecureSign {
+        /// Path to the encrypted keystore
+        #[clap(long)]
+        keystore_path: PathBuf,
+
+        /// Address (or alias) to use for signing
+        #[clap(long)]
+        address: KeyIdentity,
+
+        /// Transaction data to sign (Base64 encoded BCS serialized TransactionData)
+        #[clap(long)]
+        data: String,
+
+        /// Password (if not provided, will be prompted)
+        #[clap(long)]
+        password: Option<String>,
+
+        /// Transaction intent (default: TransactionData)
+        #[clap(long)]
+        intent: Option<Intent>,
+    },
 }
 
 // Command Output types
@@ -559,6 +582,7 @@ pub enum CommandOutput {
     ZkLoginInsecureSignPersonalMessage(ZkLoginInsecureSignPersonalMessage),
     ZkLoginSigVerify(ZkLoginSigVerifyResponse),
     Success(String),
+    SecureSignData(SecureSignData),
 }
 
 impl KeyToolCommand {
@@ -992,7 +1016,49 @@ impl KeyToolCommand {
                     serialized_sig_base64: serialized_sig,
                 })
             }
-
+            KeyToolCommand::SecureSign {
+                keystore_path,
+                address,
+                data,
+                password,
+                intent,
+            } => {
+                use sui_keys::keystore::EncryptedFileBasedKeystore;
+                
+                // Handle password
+                let password = match password {
+                    Some(pwd) => pwd,
+                    None => {
+                        print!("Enter password: ");
+                        io::stdout().flush()?;
+                        rpassword::read_password()?
+                    }
+                };
+                
+                // 주소 파싱
+                let address = get_identity_address_from_keystore(address, keystore)?;
+                
+                // Load encrypted keystore
+                let mut encrypted_keystore = EncryptedFileBasedKeystore::new(
+                    &keystore_path,
+                    &password,
+                    false, // 메모리에 복호화된 키 보관하지 않음 (보안을 위해)
+                )?;
+                
+                // Call secure_sign function to sign transaction
+                let sign_data = encrypted_keystore.secure_sign(
+                    &address,
+                    &data,
+                    &password,
+                    intent
+                )?;
+                
+                // 서명 후 메모리에서 키 제거 (보안을 위해)
+                encrypted_keystore.clear_all_keys()?;
+                
+                // 결과 반환
+                CommandOutput::SecureSignData(sign_data)
+            }
             KeyToolCommand::Unpack { keypair } => {
                 let keypair = SuiKeyPair::decode_base64(&keypair)
                     .map_err(|_| anyhow!("Invalid Base64 encode keypair"))?;
@@ -1257,7 +1323,7 @@ impl KeyToolCommand {
                     &kp_bigint.to_string(),
                     ephemeral_key_identifier,
                     keystore,
-                    network.as_str(),
+                    &network,
                     test_multisig,
                     sign_with_sk,
                 )
@@ -1278,10 +1344,10 @@ impl KeyToolCommand {
                     &parsed_token,
                     max_epoch,
                     &jwt_randomness,
-                    &kp_bigint.to_string(),
+                    &kp_bigint,
                     ephemeral_key_identifier,
                     keystore,
-                    network.as_str(),
+                    &network,
                     test_multisig,
                     sign_with_sk,
                 )
@@ -1393,23 +1459,23 @@ impl KeyToolCommand {
                     home
                 });
                 
-                // 비밀번호 처리
+                // Handle password
                 let password = match password {
                     Some(pwd) => pwd,
                     None => {
-                        print!("비밀번호를 입력하세요: ");
+                        print!("Enter password: ");
                         io::stdout().flush()?;
                         rpassword::read_password()?
                     }
                 };
                 
-                // 비밀번호 확인
-                print!("비밀번호 확인: ");
+                // Confirm password
+                print!("Confirm password: ");
                 io::stdout().flush()?;
                 let confirm_password = rpassword::read_password()?;
                 
                 if password != confirm_password {
-                    return Err(anyhow!("비밀번호가 일치하지 않습니다"));
+                    return Err(anyhow!("Passwords do not match"));
                 }
                 
                 // 키스토어 생성
@@ -1432,7 +1498,7 @@ impl KeyToolCommand {
                 }
                 
                 CommandOutput::Success(format!(
-                    "암호화된 키스토어가 성공적으로 생성되었습니다: {:?}",
+                    "Encrypted keystore created successfully: {:?}",
                     keystore_path
                 ))
             }
@@ -1447,11 +1513,11 @@ impl KeyToolCommand {
                 use sui_keys::keystore::EncryptedFileBasedKeystore;
                 use std::io;
                 
-                // 비밀번호 처리
+                // Handle password
                 let password = match password {
                     Some(pwd) => pwd,
                     None => {
-                        print!("비밀번호를 입력하세요: ");
+                        print!("Enter password: ");
                         io::stdout().flush()?;
                         rpassword::read_password()?
                     }
@@ -1496,11 +1562,11 @@ impl KeyToolCommand {
                 use sui_keys::keystore::EncryptedFileBasedKeystore;
                 use std::io;
                 
-                // 비밀번호 처리
+                // Handle password
                 let password = match password {
                     Some(pwd) => pwd,
                     None => {
-                        print!("비밀번호를 입력하세요: ");
+                        print!("Enter password: ");
                         io::stdout().flush()?;
                         rpassword::read_password()?
                     }
@@ -1512,7 +1578,7 @@ impl KeyToolCommand {
                 // 키 식별자에서 주소 추출
                 let address = match key_identity {
                     KeyIdentity::Address(addr) => addr,
-                    KeyIdentity::Alias(alias) => {
+                    KeyIdentity::Alias(_) => {
                         // Option<&SuiAddress>가 아니라 &SuiAddress가 반환됨
                         // 수정: alias 문자열에서 직접 주소를 가져옵니다
                         // 실제 구현에서는 별칭->주소 조회 필요
@@ -1547,11 +1613,11 @@ impl KeyToolCommand {
                 use sui_keys::keystore::EncryptedFileBasedKeystore;
                 use std::io;
                 
-                // 비밀번호 처리
+                // Handle password
                 let password = match password {
                     Some(pwd) => pwd,
                     None => {
-                        print!("비밀번호를 입력하세요: ");
+                        print!("Enter password: ");
                         io::stdout().flush()?;
                         rpassword::read_password()?
                     }
@@ -1657,6 +1723,13 @@ impl Display for CommandOutput {
             CommandOutput::Success(message) => {
                 write!(formatter, "{}", message)
             }
+            CommandOutput::SecureSignData(s) => {
+                writeln!(
+                    formatter,
+                    "{{\n  \"digest\": \"{}\",\n  \"signature\": \"{}\",\n  \"signed_transaction\": \"{}\"\n}}",
+                    s.digest, s.sui_signature, s.signed_transaction
+                )
+            }
             _ => {
                 let json_obj = json![self];
                 let mut table = json_to_table(&json_obj);
@@ -1680,6 +1753,15 @@ impl CommandOutput {
             }
             CommandOutput::Success(message) => {
                 println!("{}", message);
+            }
+            CommandOutput::ZkLoginInsecureSignPersonalMessage(_) => {
+                println!("{}", self);
+            }
+            CommandOutput::ZkLoginSigVerify(_) => {
+                println!("{}", self);
+            }
+            CommandOutput::SecureSignData(_) => {
+                println!("{}", self);
             }
             _ => {
                 let line = if pretty {
@@ -1735,13 +1817,16 @@ impl Debug for CommandOutput {
             CommandOutput::Success(message) => {
                 writeln!(f, "{}", message)
             }
+            CommandOutput::SecureSignData(s) => {
+                writeln!(
+                    f,
+                    "{{\n  \"digest\": \"{}\",\n  \"signature\": \"{}\",\n  \"signed_transaction\": \"{}\"\n}}",
+                    s.digest, s.sui_signature, s.signed_transaction
+                )
+            }
             _ => {
                 let json_obj = json![self];
-                let mut table = json_to_table(&json_obj);
-                let style = tabled::settings::Style::rounded().horizontals([]);
-                table.with(style);
-                table.array_orientation(Orientation::Column);
-                writeln!(f, "{}", table)
+                write!(f, "{}", serde_json::to_string_pretty(&json_obj).unwrap_or_else(|_| format!("{:?}", json_obj)))
             }
         }
     }

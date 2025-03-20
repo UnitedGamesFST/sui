@@ -28,6 +28,34 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::rngs::OsRng;
 use std::num::NonZeroU32;
 use hex;
+use sui_types::crypto::DefaultHash;
+use sui_types::transaction::{Transaction, TransactionData};
+use fastcrypto::hash::HashFunction;
+
+/// Data structure for secure signing results using encrypted keystore
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SecureSignData {
+    /// SUI address of the signer
+    pub sui_address: SuiAddress,
+    
+    /// Base64 encoded transaction data serialization string
+    pub raw_tx_data: String,
+    
+    /// Intent structure used
+    pub intent: Intent,
+    
+    /// Base64 encoded serialized IntentMessage in the form of (intent || message)
+    pub raw_intent_msg: String,
+    
+    /// Blake2b hash of the signed intent message (Base64 encoded)
+    pub digest: String,
+    
+    /// Base64 encoded string of complete Sui signature (flag || signature || pubkey)
+    pub sui_signature: String,
+    
+    /// Signed transaction
+    pub signed_transaction: String,
+}
 
 #[derive(Serialize, Deserialize)]
 #[enum_dispatch(AccountKeystore)]
@@ -305,7 +333,7 @@ impl AccountKeystore for FileBasedKeystore {
         old_alias: &str,
         new_alias: Option<&str>,
     ) -> Result<String, anyhow::Error> {
-        // 1단계: 주소 찾기
+        // Step 1: Find address
         let addr_opt = {
             let mut addr = None;
             for (address, alias) in &self.aliases {
@@ -322,7 +350,7 @@ impl AccountKeystore for FileBasedKeystore {
             None => bail!("Cannot find an address for alias {old_alias}"),
         };
         
-        // 2단계: 새 alias 설정
+        // Step 2: Set new alias
         let new_alias_name = match new_alias {
             Some(a) if self.alias_exists(a) && a != old_alias => {
                 bail!("Alias {a} already exists. Please choose another alias.")
@@ -337,7 +365,7 @@ impl AccountKeystore for FileBasedKeystore {
             ),
         };
         
-        // 3단계: 업데이트
+        // Step 3: Update
         if let Some(alias_struct) = self.aliases.get_mut(&address) {
             alias_struct.alias = new_alias_name.clone();
         } else {
@@ -391,7 +419,7 @@ impl FileBasedKeystore {
                 )
             })?;
 
-            // 별칭 정보를 BTreeMap으로 변환
+            // Convert alias information to BTreeMap
             let mut aliases_map = BTreeMap::new();
             for alias in alias_vec {
                 if let Ok(public_key) = PublicKey::decode_base64(&alias.public_key_base64) {
@@ -670,38 +698,32 @@ mod tests {
     }
 }
 
-/// 암호화된 키스토어의 파일 형식을 정의하는 구조체
+/// Structure defining the file format of the encrypted keystore
 #[derive(Serialize, Deserialize)]
-struct EncryptedKeyData {
-    /// 암호화 버전 (향후 버전 업그레이드를 위해)
-    version: u8,
-    /// 암호화된 키 데이터 (Base64로 인코딩)
-    ciphertext: String,
-    /// 암호화에 사용된 IV (Base64로 인코딩)
-    iv: String,
-    /// 비밀번호로부터 키를 생성할 때 사용된 솔트 (Base64로 인코딩)
-    salt: String,
-    /// KDF 반복 횟수
-    iterations: u32,
-    /// 암호화 방식 (현재는 "aes-256-gcm"만 지원)
-    cipher: String,
-    /// 주소 (복호화 후 검증에 사용)
-    address: String,
+pub struct EncryptedKeyData {
+    /// Encryption version (for future version upgrades)
+    pub version: u8,
+    /// Encrypted key data (Base64 encoded)
+    pub encrypted_data: String,
+    /// IV used for encryption (Base64 encoded)
+    pub iv: String,
+    /// Salt used for key derivation from password (Base64 encoded)
+    pub salt: String,
 }
 
-/// 암호화된 파일 기반 키스토어 구현
+/// Encrypted file based keystore implementation
 #[derive(Default, Serialize, Deserialize)]
 pub struct EncryptedFileBasedKeystore {
     keys: BTreeMap<SuiAddress, SuiKeyPair>,
     aliases: BTreeMap<SuiAddress, Alias>,
     path: Option<PathBuf>,
-    /// 메모리에 복호화된 키를 보관할지 여부
+    /// Whether to keep decrypted keys in memory
     #[serde(default)]
     keep_in_memory: bool,
 }
 
 impl EncryptedFileBasedKeystore {
-    /// 새로운 암호화된 키스토어 생성
+    /// Create a new encrypted keystore
     pub fn new(path: &PathBuf, password: &str, keep_in_memory: bool) -> Result<Self, anyhow::Error> {
         let mut keystore = Self {
             keys: BTreeMap::new(),
@@ -710,24 +732,24 @@ impl EncryptedFileBasedKeystore {
             keep_in_memory,
         };
         
-        // 파일 시스템에서 키스토어 설정
+        // Load keystore from file system
         if let Some(path) = &keystore.path {
             let key_dir = path.parent().ok_or_else(|| anyhow!("Invalid keystore path"))?;
             if !key_dir.exists() {
                 fs::create_dir_all(key_dir)?;
             }
             
-            // 이미 암호화된 키 파일이 있는지 확인하고 로드
+            // Check if there are already encrypted key files and load
             if key_dir.exists() && key_dir.is_dir() {
                 for entry in fs::read_dir(key_dir)? {
                     let entry = entry?;
                     let file_path = entry.path();
                     
-                    // .encrypted 확장자를 가진 파일만 처리
+                    // Only process files with .encrypted extension
                     if file_path.extension().map_or(false, |ext| ext == "encrypted") {
                         match keystore.load_and_decrypt_key(&file_path, password) {
                             Ok((address, keypair)) => {
-                                // 메모리에 저장 옵션이 켜져 있으면 복호화된 키를 메모리에 저장
+                                // If memory storage option is turned on, store decrypted key in memory
                                 if keystore.keep_in_memory {
                                     keystore.keys.insert(address, keypair);
                                 }
@@ -740,7 +762,7 @@ impl EncryptedFileBasedKeystore {
                 }
             }
 
-            // 별칭 파일 로드 시도
+            // Try to load alias file
             let mut aliases_path = path.clone();
             aliases_path.set_extension("aliases");
             
@@ -760,7 +782,7 @@ impl EncryptedFileBasedKeystore {
                     )
                 })?;
 
-                // 별칭 정보 가져오기
+                // Get alias information
                 for alias in alias_vec {
                     if let Ok(public_key) = PublicKey::decode_base64(&alias.public_key_base64) {
                         let address: SuiAddress = (&public_key).into();
@@ -773,33 +795,33 @@ impl EncryptedFileBasedKeystore {
         Ok(keystore)
     }
 
-    /// 비밀번호로 키페어를 암호화하여 저장
+    /// Encrypt and save key pair with password
     pub fn encrypt_and_save_keypair(&self, keypair: &SuiKeyPair, password: &str) -> Result<(), anyhow::Error> {
         let address: SuiAddress = (&keypair.public()).into();
         
-        // 디렉토리 경로 확인 및 생성
+        // Check directory path and create if it doesn't exist
         if let Some(path) = &self.path {
             let key_dir = path.parent().ok_or_else(|| anyhow!("Invalid keystore path"))?;
             if !key_dir.exists() {
                 fs::create_dir_all(key_dir)?;
             }
             
-            // 키 파일 경로 생성
+            // Create key file path
             let mut key_path = key_dir.to_path_buf();
             key_path.push(format!("{}.encrypted", address));
             
-            // 암호화 매개변수 생성
+            // Generate encryption parameters
             let mut salt = [0u8; 16];
             OsRng.fill_bytes(&mut salt);
             
             let mut iv = [0u8; NONCE_LEN];
             OsRng.fill_bytes(&mut iv);
             
-            // 비밀번호로부터 암호화 키 유도
-            const ITERATIONS: u32 = 100_000; // 충분히 많은 반복 횟수
+            // Derive encryption key from password
+            const ITERATIONS: u32 = 100_000; // Enough iterations
             let iterations = NonZeroU32::new(ITERATIONS).unwrap();
             
-            let mut derived_key = [0u8; 32]; // AES-256 키 크기
+            let mut derived_key = [0u8; 32]; // AES-256 key size
             pbkdf2::derive(
                 pbkdf2::PBKDF2_HMAC_SHA256, 
                 iterations, 
@@ -808,34 +830,31 @@ impl EncryptedFileBasedKeystore {
                 &mut derived_key
             );
             
-            // 키페어 직렬화
+            // Serialize key pair
             let serialized_keypair = keypair.encode_base64();
             
-            // AES-GCM으로 암호화
+            // Encrypt
             let unbound_key = UnboundKey::new(&aead::AES_256_GCM, &derived_key)
                 .map_err(|_| anyhow!("Failed to create encryption key"))?;
             let less_safe_key = LessSafeKey::new(unbound_key);
             
             let nonce = Nonce::assume_unique_for_key(iv);
-            let aad = Aad::empty(); // 추가 인증 데이터 없음
+            let aad = Aad::empty(); // No additional authentication data
             
             let mut serialized_data = serialized_keypair.as_bytes().to_vec();
             less_safe_key
                 .seal_in_place_append_tag(nonce, aad, &mut serialized_data)
                 .map_err(|_| anyhow!("Encryption failed"))?;
             
-            // 암호화된 데이터 구조 생성
+            // Create encrypted data structure
             let encrypted_data = EncryptedKeyData {
                 version: 1,
-                ciphertext: BASE64.encode(&serialized_data),
+                encrypted_data: BASE64.encode(&serialized_data),
                 iv: BASE64.encode(&iv),
                 salt: BASE64.encode(&salt),
-                iterations: ITERATIONS,
-                cipher: "aes-256-gcm".to_string(),
-                address: address.to_string(),
             };
             
-            // JSON으로 직렬화하여 파일에 저장
+            // Serialize to JSON and save to file
             let json = serde_json::to_string_pretty(&encrypted_data)?;
             fs::write(key_path, json)?;
             
@@ -845,23 +864,23 @@ impl EncryptedFileBasedKeystore {
         }
     }
     
-    /// 암호화된 키 파일을 비밀번호로 복호화
+    /// Decrypt encrypted key file with password
     fn load_and_decrypt_key(&self, key_path: &Path, password: &str) -> Result<(SuiAddress, SuiKeyPair), anyhow::Error> {
-        // 파일에서 암호화된 데이터 읽기
+        // Read encrypted data from file
         let json = fs::read_to_string(key_path)?;
         let encrypted_data: EncryptedKeyData = serde_json::from_str(&json)?;
         
-        // 현재는 버전 1만 지원
+        // Only version 1 is supported
         if encrypted_data.version != 1 {
             return Err(anyhow!("Unsupported encryption version: {}", encrypted_data.version));
         }
         
-        // 현재는 aes-256-gcm만 지원
+        // Only aes-256-gcm is supported
         if encrypted_data.cipher != "aes-256-gcm" {
             return Err(anyhow!("Unsupported cipher: {}", encrypted_data.cipher));
         }
         
-        // Base64 디코딩
+        // Base64 decode
         let ciphertext = BASE64.decode(&encrypted_data.ciphertext)?;
         let iv = BASE64.decode(&encrypted_data.iv)?;
         let salt = BASE64.decode(&encrypted_data.salt)?;
@@ -870,7 +889,7 @@ impl EncryptedFileBasedKeystore {
             return Err(anyhow!("Invalid IV length"));
         }
         
-        // 비밀번호로부터 암호화 키 유도
+        // Derive encryption key from password
         let iterations = NonZeroU32::new(encrypted_data.iterations)
             .ok_or_else(|| anyhow!("Invalid iteration count"))?;
         
@@ -883,7 +902,7 @@ impl EncryptedFileBasedKeystore {
             &mut derived_key
         );
         
-        // 복호화
+        // Decrypt
         let unbound_key = UnboundKey::new(&aead::AES_256_GCM, &derived_key)
             .map_err(|_| anyhow!("Failed to create decryption key"))?;
         let less_safe_key = LessSafeKey::new(unbound_key);
@@ -898,11 +917,11 @@ impl EncryptedFileBasedKeystore {
             .open_in_place(nonce, aad, &mut ciphertext_copy)
             .map_err(|_| anyhow!("Decryption failed - wrong password or corrupted data"))?;
         
-        // 키페어 복원
+        // Restore key pair
         let plaintext_str = std::str::from_utf8(plaintext)?;
         let keypair = SuiKeyPair::decode_base64(plaintext_str)?;
         
-        // 주소 검증
+        // Address verification
         let address: SuiAddress = (&keypair.public()).into();
         let expected_address = parse_sui_address(&encrypted_data.address)?;
         
@@ -913,7 +932,7 @@ impl EncryptedFileBasedKeystore {
         Ok((address, keypair))
     }
     
-    /// 키스토어에 키 추가 (암호화하여 저장)
+    /// Add key to keystore (encrypt and save)
     pub fn add_key_with_password(
         &mut self, 
         alias: Option<String>, 
@@ -923,7 +942,7 @@ impl EncryptedFileBasedKeystore {
         let address: SuiAddress = (&keypair.public()).into();
         let alias = self.create_alias(alias)?;
         
-        // 별칭 정보 저장
+        // Save alias information
         self.aliases.insert(
             address,
             Alias {
@@ -932,32 +951,32 @@ impl EncryptedFileBasedKeystore {
             },
         );
         
-        // 암호화하여 파일에 저장
+        // Encrypt and save to file
         self.encrypt_and_save_keypair(&keypair, password)?;
         
-        // 옵션에 따라 메모리에 키를 저장
+        // Optionally store key in memory
         if self.keep_in_memory {
             self.keys.insert(address, keypair);
         }
         
-        // 별칭 파일 저장
+        // Save alias file
         self.save_aliases()?;
         
         Ok(())
     }
     
-    /// 비밀번호로 키를 복호화하여 메모리에 로드한 후 참조를 반환합니다.
+    /// Decrypt key with password and load it into memory for reference
     pub fn get_key_with_password(
         &mut self, 
         address: &SuiAddress, 
         password: &str
     ) -> Result<(), anyhow::Error> {
-        // 이미 메모리에 있으면 성공 반환
+        // Success if already in memory
         if self.keys.contains_key(address) {
             return Ok(());
         }
         
-        // 메모리에 없으면 파일에서 복호화
+        // If not in memory, decrypt from file
         if let Some(path) = &self.path {
             let key_dir = path.parent().ok_or_else(|| anyhow!("Invalid keystore path"))?;
             let key_path = key_dir.join(format!("{}.encrypted", address));
@@ -965,7 +984,7 @@ impl EncryptedFileBasedKeystore {
             if key_path.exists() {
                 let (_, keypair) = self.load_and_decrypt_key(&key_path, password)?;
                 
-                // 메모리에 저장
+                // Store in memory
                 self.keys.insert(*address, keypair);
                 Ok(())
             } else {
@@ -976,13 +995,19 @@ impl EncryptedFileBasedKeystore {
         }
     }
     
-    /// 영구적으로 모든 키를 제거 (파일 삭제)
+    /// Remove all keys from memory (for security)
     pub fn clear_all_keys(&mut self) -> Result<(), anyhow::Error> {
-        // 메모리에서 키 제거
+        self.keys.clear();
+        Ok(())
+    }
+    
+    /// Permanently remove all keys (delete files)
+    pub fn delete_all_keys(&mut self) -> Result<(), anyhow::Error> {
+        // Remove keys from memory
         self.keys.clear();
         self.aliases.clear();
         
-        // 파일 시스템에서 키 파일 삭제
+        // Remove keys from file system
         if let Some(path) = &self.path {
             let key_dir = path.parent().ok_or_else(|| anyhow!("Invalid keystore path"))?;
             if key_dir.exists() && key_dir.is_dir() {
@@ -995,7 +1020,7 @@ impl EncryptedFileBasedKeystore {
                 }
             }
             
-            // 별칭 파일 삭제
+            // Remove alias file
             let mut aliases_path = path.clone();
             aliases_path.set_extension("aliases");
             if aliases_path.exists() {
@@ -1006,17 +1031,17 @@ impl EncryptedFileBasedKeystore {
         Ok(())
     }
     
-    /// 메모리 옵션 설정
+    /// Set memory storage option
     pub fn set_keep_in_memory(&mut self, keep_in_memory: bool) {
         self.keep_in_memory = keep_in_memory;
         
-        // 옵션이 꺼지면 메모리에서 키 제거
+        // If option is turned off, remove keys from memory
         if !keep_in_memory {
             self.keys.clear();
         }
     }
     
-    // FileBasedKeystore에서 가져온 메서드들
+    // FileBasedKeystore methods
     pub fn set_path(&mut self, path: &Path) {
         self.path = Some(path.to_path_buf());
     }
@@ -1039,7 +1064,7 @@ impl EncryptedFileBasedKeystore {
         Ok(())
     }
 
-    /// 니모닉 문구에서 키를 가져와 암호화된 키스토어에 추가
+    /// Import key from mnemonic and add to encrypted keystore
     pub fn import_from_mnemonic(
         &mut self, 
         mnemonic: &str,
@@ -1048,14 +1073,14 @@ impl EncryptedFileBasedKeystore {
         alias: Option<String>,
         password: &str,
     ) -> Result<SuiAddress, anyhow::Error> {
-        // 니모닉 생성
+        // Generate mnemonic
         let m = Mnemonic::from_phrase(mnemonic, Language::English)
             .map_err(|e| anyhow!("Invalid mnemonic phrase: {}", e))?;
         
-        // 시드 생성
+        // Generate seed
         let seed = Seed::new(&m, "");
         
-        // 키 쌍 유도
+        // Derive key pair
         let scheme = key_scheme.unwrap_or(SignatureScheme::ED25519);
         let (address, keypair) = derive_key_pair_from_path(
             seed.as_bytes(), 
@@ -1063,18 +1088,77 @@ impl EncryptedFileBasedKeystore {
             &scheme
         )?;
         
-        // 키스토어에 추가
+        // Add to keystore
         self.add_key_with_password(alias, keypair, password)?;
         
         Ok(address)
     }
+
+    /// Convenience function for signing
+    /// Sign transaction data and return signature information
+    pub fn secure_sign(
+        &mut self, 
+        address: &SuiAddress, 
+        data: &str, 
+        password: &str,
+        intent: Option<Intent>
+    ) -> Result<SecureSignData, anyhow::Error> {
+        // Load key into memory (decrypt with password)
+        self.get_key_with_password(address, password)?;
+        
+        // Set intent
+        let intent = intent.unwrap_or_else(Intent::sui_transaction);
+        let intent_clone = intent.clone();
+        
+        // Decode transaction data
+        let msg: TransactionData = bcs::from_bytes(&BASE64.decode(data)
+            .map_err(|e| anyhow!("Cannot deserialize transaction data: {:?}", e))?)?;
+        
+        // Generate intent message
+        let intent_msg = IntentMessage::new(intent, msg);
+        let raw_intent_msg = BASE64.encode(bcs::to_bytes(&intent_msg)?);
+        
+        // Calculate hash
+        let mut hasher = DefaultHash::default();
+        hasher.update(bcs::to_bytes(&intent_msg)?);
+        let digest = hasher.finalize().digest;
+        
+        // Sign
+        let sui_signature = self.sign_secure(
+            address, 
+            &intent_msg.value, 
+            intent_msg.intent
+        )?;
+        
+        // Create signed transaction
+        let signed_tx = Transaction::from_data(
+            intent_msg.value, 
+            vec![sui_signature.clone()]
+        );
+        let signed_tx_bytes = bcs::to_bytes(&signed_tx)?;
+        let signed_tx_base64 = BASE64.encode(signed_tx_bytes);
+        
+        // Optionally remove key from memory after signing
+        // self.clear_all_keys()?;
+        
+        // Return result
+        Ok(SecureSignData {
+            sui_address: *address,
+            raw_tx_data: data.to_owned(),
+            intent: intent_clone,
+            raw_intent_msg,
+            digest: BASE64.encode(digest),
+            sui_signature: sui_signature.encode_base64(),
+            signed_transaction: signed_tx_base64,
+        })
+    }
 }
 
-// AccountKeystore 트레이트 구현
+// AccountKeystore trait implementation
 impl AccountKeystore for EncryptedFileBasedKeystore {
     fn sign_hashed(&self, address: &SuiAddress, msg: &[u8]) -> Result<Signature, signature::Error> {
-        // 이 구현은 메모리에 있는 키만 사용 가능합니다.
-        // 실제 사용 시에는 비밀번호를 입력받는 프롬프트가 필요합니다.
+        // This implementation can only use keys in memory.
+        // For actual use, a prompt for entering the password is needed.
         if let Some(key) = self.keys.get(address) {
             Ok(Signature::new_hashed(msg, key))
         } else {
@@ -1091,7 +1175,7 @@ impl AccountKeystore for EncryptedFileBasedKeystore {
     where
         T: Serialize,
     {
-        // 이 구현은 메모리에 있는 키만 사용 가능합니다.
+        // This implementation can only use keys in memory.
         if let Some(key) = self.keys.get(address) {
             Ok(Signature::new_secure(&IntentMessage::new(intent, msg), key))
         } else {
@@ -1100,15 +1184,15 @@ impl AccountKeystore for EncryptedFileBasedKeystore {
     }
 
     fn add_key(&mut self, _alias: Option<String>, _keypair: SuiKeyPair) -> Result<(), anyhow::Error> {
-        // 이 메서드는 비밀번호 없이 저장할 수 없습니다.
+        // This method cannot be used without a password
         Err(anyhow!("For EncryptedFileBasedKeystore, use add_key_with_password instead"))
     }
 
     fn keys(&self) -> Vec<PublicKey> {
-        // 메모리에 있는 키 + 파일 시스템에 있는 암호화된 키의 공개키 반환
+        // Return public keys from memory + public keys from encrypted storage in keystore
         let mut result: Vec<PublicKey> = self.keys.values().map(|key| key.public()).collect();
         
-        // 별칭에서 공개키 추가 (메모리에 없는 키도 포함)
+        // Add alias public keys (include keys not in memory)
         for alias in self.aliases.values() {
             if let Ok(pubkey) = PublicKey::decode_base64(&alias.public_key_base64) {
                 if !result.iter().any(|k| k == &pubkey) {
@@ -1121,7 +1205,7 @@ impl AccountKeystore for EncryptedFileBasedKeystore {
     }
 
     fn get_key(&self, address: &SuiAddress) -> Result<&SuiKeyPair, anyhow::Error> {
-        // 이 구현은 메모리에 있는 키만 반환합니다.
+        // This implementation can only return keys in memory.
         match self.keys.get(address) {
             Some(key) => Ok(key),
             None => Err(anyhow!("Key not found in memory. Use get_key_with_password to load it from encrypted storage.")),
@@ -1184,28 +1268,28 @@ impl AccountKeystore for EncryptedFileBasedKeystore {
 
 // Helper function to parse SuiAddress from string
 fn parse_sui_address(s: &str) -> Result<SuiAddress, anyhow::Error> {
-    // 문자열이 0x로 시작하는지 확인
+    // Check if string starts with 0x
     let s = if s.starts_with("0x") { &s[2..] } else { s };
     
-    // 16진수 문자열을 바이트 배열로 변환
+    // Convert hex string to byte array
     let bytes = hex::decode(s)
         .map_err(|e| anyhow!("Invalid hex string for SuiAddress: {}", e))?;
     
-    // SuiAddress 생성
+    // Create SuiAddress
     SuiAddress::try_from(bytes.as_slice())
         .map_err(|e| anyhow!("Failed to convert bytes to SuiAddress: {}", e))
 }
 
 // Helper function to parse a private key string to SuiKeyPair
 pub fn keypair_from_str(s: &str) -> Result<SuiKeyPair, anyhow::Error> {
-    // Bech32 디코딩 지원 등 이 함수는 실제 구현을 위해서는 추가적인 작업이 필요합니다.
-    // 여기서는 Base64 인코딩된 키라고 가정합니다.
+    // Bech32 decoding support etc. This function needs to be implemented for actual use.
+    // For now, assume Base64 encoded key
     if s.starts_with("suiprivkey") {
-        // TODO: Bech32 구현
+        // TODO: Implement Bech32
         return Err(anyhow!("Bech32 format not implemented yet"));
     }
     
-    // Base64 인코딩된 키라고 가정
+    // Assume Base64 encoded key
     SuiKeyPair::decode_base64(s)
         .map_err(|e| anyhow!("Failed to decode private key: {}", e))
 }

@@ -12588,6 +12588,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-kms",
  "axum 0.7.5",
+ "base64 0.21.7",
  "bcs",
  "bin-version",
  "bip32",
@@ -12603,6 +12604,7 @@ dependencies = [
  "fastcrypto-zkp",
  "fs_extra",
  "futures",
+ "hex",
  "http 1.1.0",
  "im",
  "inquire",
@@ -14324,6 +14326,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
+ "bcs",
  "bip32",
  "fastcrypto",
  "hex",
