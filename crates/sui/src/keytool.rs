@@ -42,7 +42,7 @@ use sui_keys::keypair_file::{
     read_authority_keypair_from_file, read_keypair_from_file, write_authority_keypair_to_file,
     write_keypair_to_file,
 };
-use sui_keys::keystore::{AccountKeystore, SecureSignData, Keystore};
+use sui_keys::keystore::{AccountKeystore, SecureSignData, EncryptedFileBasedKeystore, Keystore};
 use sui_types::base_types::SuiAddress;
 use sui_types::committee::EpochId;
 use sui_types::crypto::{
@@ -62,7 +62,7 @@ use tabled::settings::Rotate;
 use tabled::settings::{object::Rows, Modify, Width};
 use tracing::info;
 use std::io::{self, Write};
-use rpassword;
+
 #[cfg(test)]
 #[path = "unit_tests/keytool_tests.rs"]
 mod keytool_tests;
@@ -316,6 +316,10 @@ pub enum KeyToolCommand {
         /// Whether to migrate keys from the existing keystore
         #[clap(long)]
         migrate: bool,
+
+        /// Key scheme to use (ed25519, secp256k1, secp256r1)
+        #[clap(long)]
+        key_scheme: Option<SignatureScheme>,
     },
     
     /// Import a key (mnemonic or private key) into the encrypted keystore
@@ -1022,8 +1026,35 @@ impl KeyToolCommand {
                 data,
                 password,
                 intent,
-            } => {
-                use sui_keys::keystore::EncryptedFileBasedKeystore;
+            } => {                
+                // Parse address
+                let sui_address = match address {
+                    KeyIdentity::Address(addr) => addr,
+                    KeyIdentity::Alias(alias) => {
+                        // Get file-based encrypted keystore to resolve alias
+                        let tmp_password = password.clone().unwrap_or_else(|| {
+                            print!("Enter password for alias lookup: ");
+                            io::stdout().flush().unwrap();
+                            rpassword::read_password().unwrap_or_default()
+                        });
+                        
+                        let tmp_keystore = EncryptedFileBasedKeystore::new(&keystore_path, &tmp_password, false)?;
+                        let addresses = tmp_keystore.addresses();
+                        
+                        // Find address matching the alias
+                        let mut found_address = None;
+                        for addr in addresses {
+                            if let Ok(current_alias) = tmp_keystore.get_alias_by_address(&addr) {
+                                if current_alias == alias {
+                                    found_address = Some(addr);
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        found_address.ok_or_else(|| anyhow!("Alias {} not found in keystore", alias))?
+                    }
+                };
                 
                 // Handle password
                 let password = match password {
@@ -1035,29 +1066,26 @@ impl KeyToolCommand {
                     }
                 };
                 
-                // 주소 파싱
-                let address = get_identity_address_from_keystore(address, keystore)?;
-                
-                // Load encrypted keystore
+                // Create keystore
                 let mut encrypted_keystore = EncryptedFileBasedKeystore::new(
-                    &keystore_path,
-                    &password,
-                    false, // 메모리에 복호화된 키 보관하지 않음 (보안을 위해)
+                    &keystore_path, 
+                    &password, 
+                    false, // Keep decrypted keys in memory (for security)
                 )?;
                 
-                // Call secure_sign function to sign transaction
-                let sign_data = encrypted_keystore.secure_sign(
-                    &address,
-                    &data,
-                    &password,
+                // Sign with keystore
+                let sign_result = encrypted_keystore.secure_sign(
+                    &sui_address, 
+                    &data, 
+                    &password, 
                     intent
                 )?;
                 
-                // 서명 후 메모리에서 키 제거 (보안을 위해)
+                // Clear keys from memory (for security)
                 encrypted_keystore.clear_all_keys()?;
                 
-                // 결과 반환
-                CommandOutput::SecureSignData(sign_data)
+                // Return result
+                CommandOutput::SecureSignData(sign_result)
             }
             KeyToolCommand::Unpack { keypair } => {
                 let keypair = SuiKeyPair::decode_base64(&keypair)
@@ -1447,11 +1475,9 @@ impl KeyToolCommand {
                 password,
                 keep_in_memory,
                 migrate,
-            } => {
-                use sui_keys::keystore::EncryptedFileBasedKeystore;
-                use std::io;
-                
-                // 기본 경로 설정
+                key_scheme,
+            } => {                
+                // Set default path
                 let keystore_path = path.unwrap_or_else(|| {
                     let mut home = dirs::home_dir().expect("Cannot get home directory");
                     home.push(".sui");
@@ -1465,36 +1491,64 @@ impl KeyToolCommand {
                     None => {
                         print!("Enter password: ");
                         io::stdout().flush()?;
-                        rpassword::read_password()?
+                        let pwd = rpassword::read_password()?;
+                        print!("Confirm password: ");
+                        io::stdout().flush()?;
+                        let confirm_pwd = rpassword::read_password()?;
+                        if pwd != confirm_pwd {
+                            return Err(anyhow!("Passwords do not match"));
+                        }
+                        pwd
                     }
                 };
                 
-                // Confirm password
-                print!("Confirm password: ");
-                io::stdout().flush()?;
-                let confirm_password = rpassword::read_password()?;
-                
-                if password != confirm_password {
-                    return Err(anyhow!("Passwords do not match"));
-                }
-                
-                // 키스토어 생성
+                // Create keystore
                 let mut encrypted_keystore = EncryptedFileBasedKeystore::new(&keystore_path, &password, keep_in_memory)?;
                 
-                // 마이그레이션 옵션이 설정된 경우에만 기존 키스토어에서 키 마이그레이션
+                // Migrate keys from existing keystore if migrate option is set
                 if migrate {
+                    // Get list of addresses from existing keystore
                     let keys = keystore.addresses();
+                    println!("Migration: {} keys found.", keys.len());
+                    
                     for address in keys {
-                        // keystore에서 직접 주소로 키페어 직접 생성
-                        let _scheme = SignatureScheme::ED25519; // 예시로 ED25519 사용
-                        let dummy_keypair = SuiKeyPair::Ed25519(Ed25519KeyPair::generate(&mut rand::thread_rng()));
-                        
-                        if let Ok(alias) = keystore.get_alias_by_address(&address) {
-                            encrypted_keystore.add_key_with_password(Some(alias), dummy_keypair, &password)?;
+                        // Export keypair to string first (Base64 encoding)
+                        if let Ok(keypair) = keystore.get_key(&address) {
+                            // Export keypair to Base64
+                            let exported_keypair = keypair.encode_base64();
+                            
+                            // Restore from Base64 (this resolves ownership issues)
+                            if let Ok(imported_keypair) = SuiKeyPair::decode_base64(&exported_keypair) {
+                                // Get existing alias
+                                let alias_opt = keystore.get_alias_by_address(&address).ok();
+                                
+                                // Add to encrypted keystore
+                                match encrypted_keystore.add_key_with_password(alias_opt, imported_keypair, &password) {
+                                    Ok(_) => println!("Address {} migrated successfully", address),
+                                    Err(e) => println!("Address {} migration failed: {}", address, e),
+                                }
+                            } else {
+                                println!("Address {} keypair restoration failed", address);
+                            }
                         } else {
-                            encrypted_keystore.add_key_with_password(None, dummy_keypair, &password)?;
+                            println!("Address {} keypair retrieval failed", address);
                         }
                     }
+                } else if key_scheme.is_some() {
+                    // Create new key without migration (when key_scheme is provided)
+                    let scheme = key_scheme.unwrap();
+                    let keypair = match scheme {
+                        SignatureScheme::ED25519 => 
+                            SuiKeyPair::Ed25519(Ed25519KeyPair::generate(&mut rand::thread_rng())),
+                        SignatureScheme::Secp256k1 =>
+                            SuiKeyPair::Secp256k1(fastcrypto::secp256k1::Secp256k1KeyPair::generate(&mut rand::thread_rng())),
+                        SignatureScheme::Secp256r1 =>
+                            SuiKeyPair::Secp256r1(fastcrypto::secp256r1::Secp256r1KeyPair::generate(&mut rand::thread_rng())),
+                        _ => return Err(anyhow!("Unsupported key scheme: {:?}", scheme)),
+                    };
+                    
+                    // Add newly generated key
+                    encrypted_keystore.add_key_with_password(None, keypair, &password)?;
                 }
                 
                 CommandOutput::Success(format!(
@@ -1509,10 +1563,7 @@ impl KeyToolCommand {
                 key_scheme,
                 derivation_path,
                 alias,
-            } => {
-                use sui_keys::keystore::EncryptedFileBasedKeystore;
-                use std::io;
-                
+            } => {                
                 // Handle password
                 let password = match password {
                     Some(pwd) => pwd,
@@ -1523,45 +1574,55 @@ impl KeyToolCommand {
                     }
                 };
                 
-                // 키스토어 로드
+                // Load keystore
                 let mut encrypted_keystore = EncryptedFileBasedKeystore::new(&path, &password, false)?;
                 
-                // 키 생성 또는 가져오기
+                // Create or import keypair
                 let keypair = if input_string.starts_with("suiprivkey") {
+                    // Restore keypair from Bech32 encoded private key
                     SuiKeyPair::decode_base64(&input_string)?
                 } else {
-                    // 니모닉으로 처리
-                    let _path = derivation_path.unwrap_or_else(|| {
-                        // 기본 경로 설정
+                    // Process as mnemonic
+                    let path = derivation_path.unwrap_or_else(|| {
+                        // Set default derivation path
                         match key_scheme {
                             SignatureScheme::ED25519 => "m/44'/784'/0'/0'/0'".parse().unwrap(),
                             SignatureScheme::Secp256k1 => "m/54'/784'/0'/0/0".parse().unwrap(),
                             SignatureScheme::Secp256r1 => "m/74'/784'/0'/0/0".parse().unwrap(),
-                            _ => panic!("지원되지 않는 서명 방식입니다"),
+                            _ => panic!("Unsupported signature scheme"),
                         }
                     });
                     
-                    // 니모닉으로부터 단순히 새 키페어 생성
-                    let dummy_keypair = SuiKeyPair::Ed25519(Ed25519KeyPair::generate(&mut rand::thread_rng()));
-                    dummy_keypair
+                    // Generate keypair from mnemonic
+                    let (_, keypair, _, _) = generate_new_key(key_scheme, Some(path), Some(input_string.clone()))?;
+                    keypair
                 };
                 
-                // 공개 정보로 Key 객체 생성 (먼저 생성)
+                // Create Key object with public information
                 let key = Key::from(&keypair);
+                let sui_address = key.sui_address;
                 
-                // 키스토어에 키 추가 (copy가 없으므로 이제 keypair를 사용 불가)
-                encrypted_keystore.add_key_with_password(alias, keypair, &password)?;
+                // Add key to keystore
+                encrypted_keystore.add_key_with_password(alias.clone(), keypair, &password)?;
                 
-                CommandOutput::Import(key)
+                // Use user-provided alias if available, otherwise use keystore-generated alias
+                let mut result_key = key;
+                if let Some(a) = alias {
+                    result_key.alias = Some(a);
+                } else {
+                    // Try to get alias by new key's address
+                    if let Ok(a) = encrypted_keystore.get_alias_by_address(&sui_address) {
+                        result_key.alias = Some(a);
+                    }
+                }
+                
+                CommandOutput::Import(result_key)
             }
             KeyToolCommand::ExportEncrypted {
                 path,
                 password,
                 key_identity,
-            } => {
-                use sui_keys::keystore::EncryptedFileBasedKeystore;
-                use std::io;
-                
+            } => {                
                 // Handle password
                 let password = match password {
                     Some(pwd) => pwd,
@@ -1572,47 +1633,52 @@ impl KeyToolCommand {
                     }
                 };
                 
-                // 키스토어 로드
+                // Load keystore
                 let mut encrypted_keystore = EncryptedFileBasedKeystore::new(&path, &password, false)?;
                 
-                // 키 식별자에서 주소 추출
+                // Extract address from key identifier
                 let address = match key_identity {
                     KeyIdentity::Address(addr) => addr,
-                    KeyIdentity::Alias(_) => {
-                        // Option<&SuiAddress>가 아니라 &SuiAddress가 반환됨
-                        // 수정: alias 문자열에서 직접 주소를 가져옵니다
-                        // 실제 구현에서는 별칭->주소 조회 필요
-                        SuiAddress::random_for_testing_only()
+                    KeyIdentity::Alias(alias) => {
+                        // Find address matching the alias
+                        let addresses = encrypted_keystore.addresses();
+                        let mut found_address = None;
+                        
+                        for addr in addresses {
+                            if let Ok(current_alias) = encrypted_keystore.get_alias_by_address(&addr) {
+                                if current_alias == alias {
+                                    found_address = Some(addr);
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        found_address.ok_or_else(|| anyhow!("Alias {} not found in keystore", alias))?
                     }
                 };
                 
-                // 키스토어에서 키 복호화하여 메모리에 로드
+                // Decrypt key from keystore and load into memory
                 encrypted_keystore.get_key_with_password(&address, &password)?;
                 
-                // 메모리에 있는 키를 찾음
-                if encrypted_keystore.addresses().iter().any(|a| a == &address) {
-                    // 자세한 정보만 출력하고 키 내보내기 생략 (실제로는 직접 키 접근 필요)
-                    let mut key = Key::from(
-                        PublicKey::try_from_bytes(SignatureScheme::ED25519, &[1u8; 32]).unwrap(),
-                    );
-                    key.sui_address = address;
-                    let exported_key = ExportedKey {
-                        exported_private_key: "PRIVATE_KEY_EXPORT_PLACEHOLDER".to_string(),
-                        key,
-                    };
-                    CommandOutput::Export(exported_key)
-                } else {
-                    return Err(anyhow!("주소 {address}에 대한 키를 찾을 수 없습니다"));
-                }
+                // Get the keypair directly from keystore
+                let keypair = encrypted_keystore.get_key(&address)?;
+                let key = Key::from(keypair);
+                
+                // Encode the key
+                let exported_private_key = keypair.encode_base64();
+                
+                let exported_key = ExportedKey {
+                    exported_private_key,
+                    key,
+                };
+                
+                CommandOutput::Export(exported_key)
             }
             KeyToolCommand::ListEncrypted {
                 path,
                 password,
                 sort_by_alias,
-            } => {
-                use sui_keys::keystore::EncryptedFileBasedKeystore;
-                use std::io;
-                
+            } => {                
                 // Handle password
                 let password = match password {
                     Some(pwd) => pwd,
@@ -1623,28 +1689,50 @@ impl KeyToolCommand {
                     }
                 };
                 
-                // 키스토어 로드
-                let mut encrypted_keystore = EncryptedFileBasedKeystore::new(&path, &password, false)?;
+                // Load keystore
+                let mut encrypted_keystore = EncryptedFileBasedKeystore::new(&path, &password, true)?; // Set keep_in_memory to true to access public keys
                 
-                // 키스토어 내의 모든 키를 메모리에 로드
+                // Extract addresses and public keys from keystore
                 let addresses = encrypted_keystore.addresses();
-                for address in &addresses {
-                    encrypted_keystore.get_key_with_password(address, &password)?;
+                let public_keys = encrypted_keystore.keys();
+                
+                // Create a map of address to public key
+                let mut address_to_pubkey = std::collections::HashMap::new();
+                for pk in public_keys {
+                    let address: SuiAddress = (&pk).into();
+                    address_to_pubkey.insert(address, pk);
                 }
                 
-                // 키 정보 추출 (메모리에 있는 주소만 조회)
+                // List keys
                 let mut keys = Vec::new();
                 for address in addresses {
-                    // 간소화된 정보 생성 (실제로는 키 추출 필요)
-                    let mut key = Key::from(
-                        PublicKey::try_from_bytes(SignatureScheme::ED25519, &[1u8; 32]).unwrap(),
-                    );
-                    key.sui_address = address;
-                    key.alias = None; // 실제로는 별칭 정보 추출 필요
-                    keys.push(key);
+                    if let Some(pk) = address_to_pubkey.get(&address) {
+                        // Create Key object from the actual public key
+                        let mut key = Key::from(pk.clone());
+                        
+                        // Try to set alias if available
+                        if let Ok(alias) = encrypted_keystore.get_alias_by_address(&address) {
+                            key.alias = Some(alias);
+                        }
+                        
+                        keys.push(key);
+                    } else {
+                        // Fallback if public key not in memory but address is known
+                        // (should rarely happen with keep_in_memory=true)
+                        let key = Key {
+                            alias: encrypted_keystore.get_alias_by_address(&address).ok(),
+                            sui_address: address,
+                            public_base64_key: String::from("unavailable"),
+                            key_scheme: String::from("unavailable"),
+                            flag: 0,
+                            mnemonic: None,
+                            peer_id: None,
+                        };
+                        keys.push(key);
+                    }
                 }
                 
-                // 별칭으로 정렬 (요청된 경우)
+                // Sort keys by alias if requested
                 if sort_by_alias {
                     keys.sort_by(|a, b| {
                         let a_alias = a.alias.clone().unwrap_or_default();
@@ -1652,6 +1740,9 @@ impl KeyToolCommand {
                         a_alias.cmp(&b_alias)
                     });
                 }
+                
+                // Clean up memory for security
+                encrypted_keystore.clear_all_keys()?;
                 
                 CommandOutput::List(keys)
             }

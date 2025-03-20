@@ -709,6 +709,14 @@ pub struct EncryptedKeyData {
     pub iv: String,
     /// Salt used for key derivation from password (Base64 encoded)
     pub salt: String,
+    /// The encryption cipher used
+    pub cipher: String,
+    /// Number of iterations for PBKDF2
+    pub iterations: u32,
+    /// The Sui address corresponding to this key
+    pub address: String,
+    /// The ciphertext (Base64 encoded)
+    pub ciphertext: String,
 }
 
 /// Encrypted file based keystore implementation
@@ -747,16 +755,12 @@ impl EncryptedFileBasedKeystore {
                     
                     // Only process files with .encrypted extension
                     if file_path.extension().map_or(false, |ext| ext == "encrypted") {
-                        match keystore.load_and_decrypt_key(&file_path, password) {
-                            Ok((address, keypair)) => {
-                                // If memory storage option is turned on, store decrypted key in memory
-                                if keystore.keep_in_memory {
-                                    keystore.keys.insert(address, keypair);
-                                }
-                            },
-                            Err(e) => {
-                                eprintln!("Failed to decrypt key file {}: {}", file_path.display(), e);
-                            }
+                        let (address, keypair) = keystore.load_and_decrypt_key(&file_path, password)
+                            .with_context(|| format!("Failed to decrypt key file: {}", file_path.display()))?;
+                            
+                        // If memory storage option is turned on, store decrypted key in memory
+                        if keystore.keep_in_memory {
+                            keystore.keys.insert(address, keypair);
                         }
                     }
                 }
@@ -852,6 +856,10 @@ impl EncryptedFileBasedKeystore {
                 encrypted_data: BASE64.encode(&serialized_data),
                 iv: BASE64.encode(&iv),
                 salt: BASE64.encode(&salt),
+                cipher: "aes-256-gcm".to_string(),
+                iterations: ITERATIONS,
+                address: address.to_string(),
+                ciphertext: BASE64.encode(&serialized_data),
             };
             
             // Serialize to JSON and save to file
