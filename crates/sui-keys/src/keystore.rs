@@ -445,9 +445,30 @@ impl FileBasedKeystore {
                         )
                     })?;
 
+            // Improve path handling
             let mut aliases_path = path.clone();
+            
+            // Create file under directory if path is a directory
+            if path.is_dir() {
+                aliases_path.push("encrypted");
+            }
+            
+            // Set file extension
             aliases_path.set_extension("aliases");
-            fs::write(aliases_path, aliases_store)?
+            
+            // Verify directory exists and create if needed
+            if let Some(parent) = aliases_path.parent() {
+                if !parent.exists() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("Failed to create directory for alias file: {:?}", parent))?;
+                }
+            }
+            
+            // Debug log
+            eprintln!("Saving aliases to: {:?}", aliases_path);
+            
+            // Save file
+            fs::write(aliases_path, aliases_store)?;
         }
         Ok(())
     }
@@ -774,14 +795,26 @@ impl EncryptedFileBasedKeystore {
         
         // Check directory path and create if it doesn't exist
         if let Some(path) = &self.path {
-            let key_dir = path.parent().ok_or_else(|| anyhow!("Invalid keystore path"))?;
+            // Improve keystore directory creation logic
+            let key_dir = if path.is_dir() {
+                path.clone()
+            } else {
+                let parent = path.parent().ok_or_else(|| anyhow!("Invalid keystore path: {:?}", path))?;
+                parent.to_path_buf()
+            };
+            
+            // Verify directory exists and create if needed
             if !key_dir.exists() {
-                fs::create_dir_all(key_dir)?;
+                fs::create_dir_all(&key_dir)
+                    .with_context(|| format!("Failed to create directory: {:?}", key_dir))?;
             }
             
             // Create key file path
-            let mut key_path = key_dir.to_path_buf();
+            let mut key_path = key_dir.clone();
             key_path.push(format!("{}.encrypted", address));
+            
+            // Debug log for file path
+            eprintln!("Saving encrypted key to: {:?}", key_path);
             
             // Generate encryption parameters
             let mut salt = [0u8; 16];
@@ -1034,9 +1067,30 @@ impl EncryptedFileBasedKeystore {
                         )
                     })?;
 
+            // Improve path handling
             let mut aliases_path = path.clone();
+            
+            // Create file under directory if path is a directory
+            if path.is_dir() {
+                aliases_path.push("encrypted");
+            }
+            
+            // Set file extension
             aliases_path.set_extension("aliases");
-            fs::write(aliases_path, aliases_store)?
+            
+            // Verify directory exists and create if needed
+            if let Some(parent) = aliases_path.parent() {
+                if !parent.exists() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("Failed to create directory for alias file: {:?}", parent))?;
+                }
+            }
+            
+            // Debug log
+            eprintln!("Saving aliases to: {:?}", aliases_path);
+            
+            // Save file
+            fs::write(aliases_path, aliases_store)?;
         }
         Ok(())
     }
