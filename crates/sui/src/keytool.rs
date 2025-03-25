@@ -34,15 +34,16 @@ use serde_json::json;
 use shared_crypto::intent::{Intent, IntentMessage, IntentScope, PersonalMessage};
 use std::fmt::{Debug, Display, Formatter};
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 use sui_keys::key_derive::generate_new_key;
 use sui_keys::keypair_file::{
     read_authority_keypair_from_file, read_keypair_from_file, write_authority_keypair_to_file,
     write_keypair_to_file,
 };
-use sui_keys::keystore::{AccountKeystore, SecureSignData, EncryptedFileBasedKeystore, Keystore};
+use sui_keys::keystore::{AccountKeystore, SignEncryptedData, EncryptedFileBasedKeystore, Keystore};
+use sui_keys::keystore::encrypted_key_utils;
 use sui_types::base_types::SuiAddress;
 use sui_types::committee::EpochId;
 use sui_types::crypto::{
@@ -61,7 +62,6 @@ use tabled::builder::Builder;
 use tabled::settings::Rotate;
 use tabled::settings::{object::Rows, Modify, Width};
 use tracing::info;
-use std::io::{self, Write};
 
 #[cfg(test)]
 #[path = "unit_tests/keytool_tests.rs"]
@@ -120,6 +120,24 @@ pub enum KeyToolCommand {
         derivation_path: Option<DerivationPath>,
         word_length: Option<String>,
     },
+
+
+    /// Generate a new encrypted key file with the specified key scheme {ed25519 | secp256k1 | secp256r1}.
+    /// Creates a standalone .encrypted file containing the key without creating a full keystore.
+    /// The file will be named with the address of the generated key and stored in the specified output directory.
+    GenerateEncrypted {
+        /// Output directory for the encrypted key file
+        #[clap(long, default_value = ".")]
+        output_dir: PathBuf,
+        
+        /// Password for encrypting the key
+        #[clap(long)]
+        password: Option<String>,
+        
+        /// Key scheme to use (ed25519, secp256k1, secp256r1)
+        #[clap(long, default_value_t = SignatureScheme::ED25519)]
+        key_scheme: SignatureScheme,
+    },
     
     /// Add a new key to Sui CLI Keystore using either the input mnemonic phrase or a Bech32 encoded 33-byte
     /// `flag || privkey` starting with "suiprivkey", the key scheme flag {ed25519 | secp256k1 | secp256r1}
@@ -136,8 +154,10 @@ pub enum KeyToolCommand {
         derivation_path: Option<DerivationPath>,
     },
     
-    /// Import a key (mnemonic or private key) into the encrypted keystore
-    #[clap(name = "import-encrypted")]
+    /// Import a key (mnemonic phrase or Bech32 encoded private key) into the encrypted keystore.
+    /// Supports mnemonic phrases of word lengths 12, 15, 18, 21, 24 or Bech32 encoded private keys
+    /// starting with "suiprivkey". Uses the specified key scheme and optional derivation path.
+    /// If no alias is provided, a random one will be generated.
     ImportEncrypted {
         /// Path to the encrypted keystore
         #[clap(long)]
@@ -168,8 +188,9 @@ pub enum KeyToolCommand {
         key_identity: KeyIdentity,
     },
     
-    /// Export a private key from the encrypted keystore
-    #[clap(name = "export-encrypted")]
+    /// Export a private key from the encrypted keystore as a Bech32 encoded string
+    /// starting with "suiprivkey". Requires the key identity (address or alias) and
+    /// the password for the encrypted keystore.
     ExportEncrypted {
         /// Path to the encrypted keystore
         #[clap(long)]
@@ -187,22 +208,6 @@ pub enum KeyToolCommand {
     /// List all keys by its Sui address, Base64 encoded public key, key scheme name in
     /// sui.keystore.
     List {
-        /// Sort by alias
-        #[clap(long, short = 's')]
-        sort_by_alias: bool,
-    },
-    
-    /// List all keys in the encrypted keystore
-    #[clap(name = "list-encrypted")]
-    ListEncrypted {
-        /// Path to the encrypted keystore
-        #[clap(long)]
-        path: PathBuf,
-        
-        /// Password for the encrypted keystore
-        #[clap(long)]
-        password: Option<String>,
-        
         /// Sort by alias
         #[clap(long, short = 's')]
         sort_by_alias: bool,
@@ -286,9 +291,10 @@ pub enum KeyToolCommand {
         base64pk: String,
     },
     
-    /// Securely sign a transaction using an encrypted key file
-    #[clap(name = "secure-sign")]
-    SecureSign {
+    /// Securely sign a transaction using an encrypted key file (.encrypted).
+    /// The key file should be named with the address of the key and have the .encrypted extension.
+    /// Provides the signature and signed transaction data for use with sui client commands.
+    SignEncrypted {
         /// Path to the key file (.encrypted)
         #[clap(long)]
         key_file: PathBuf,
@@ -377,22 +383,6 @@ pub enum KeyToolCommand {
         /// The max epoch used for the zklogin signature validity.
         #[clap(long)]
         max_epoch: EpochId,
-    },
-
-    /// Generate an encrypted key file without creating a keystore
-    #[clap(name = "generate-encrypted-key")]
-    GenerateEncryptedKey {
-        /// Output directory for the encrypted key file
-        #[clap(long)]
-        output_dir: PathBuf,
-        
-        /// Password for encrypting the key
-        #[clap(long)]
-        password: Option<String>,
-        
-        /// Key scheme to use (ed25519, secp256k1, secp256r1)
-        #[clap(long)]
-        key_scheme: SignatureScheme,
     },
 }
 
@@ -574,11 +564,11 @@ pub enum CommandOutput {
     Show(Key),
     Sign(SignData),
     SignKMS(SerializedSig),
+    SignEncryptedData(SignEncryptedData),
     ZkLoginSignAndExecuteTx(ZkLoginSignAndExecuteTx),
     ZkLoginInsecureSignPersonalMessage(ZkLoginInsecureSignPersonalMessage),
     ZkLoginSigVerify(ZkLoginSigVerifyResponse),
     Success(String),
-    SecureSignData(SecureSignData),
 }
 
 impl KeyToolCommand {
@@ -1012,13 +1002,12 @@ impl KeyToolCommand {
                     serialized_sig_base64: serialized_sig,
                 })
             }
-            KeyToolCommand::SecureSign {
+            KeyToolCommand::SignEncrypted {
                 key_file,
                 data,
                 password,
                 intent,
             } => {                
-                // Use key_file path directly
                 // Handle password
                 let password = match password {
                     Some(pwd) => pwd,
@@ -1029,38 +1018,23 @@ impl KeyToolCommand {
                     }
                 };
                 
-                // Extract address from key_file (remove .encrypted suffix from filename)
-                let file_name = key_file.file_name()
-                    .ok_or_else(|| anyhow!("Invalid key file path"))?.to_string_lossy();
+                // Try to load keypair
+                let keypair = match encrypted_key_utils::load_key_from_keystore(&key_file, &password) {
+                    Ok((kp, _)) => kp,
+                    Err(e) => {
+                        // If loading from keystore fails, try direct file processing
+                        info!("Keystore load failed, trying direct file processing: {}", e);
+                        let encrypted_data = encrypted_key_utils::load_encrypted_key_data(&key_file)?;
+                        let kp = encrypted_key_utils::decrypt_key_pair(&encrypted_data, &password)?;
+                        encrypted_key_utils::verify_key_address(&kp, &encrypted_data)?;
+                        kp
+                    }
+                };
                 
-                let address_str = file_name
-                    .strip_suffix(".encrypted")
-                    .ok_or_else(|| anyhow!("Key file must have .encrypted extension"))?;
+                // Sign transaction data
+                let sign_result = encrypted_key_utils::sign_transaction_data(&keypair, &data, intent)?;
                 
-                let sui_address = SuiAddress::from_str(address_str)
-                    .map_err(|_| anyhow!("Invalid address in key filename: {}", address_str))?;
-                
-                // Use key file directory as keystore path
-                let keystore_path = key_file.parent()
-                    .ok_or_else(|| anyhow!("Invalid key file path"))?
-                    .to_path_buf();
-                
-                // Create keystore
-                let mut encrypted_keystore = EncryptedFileBasedKeystore::new(&keystore_path, &password, false)?;
-                
-                // Sign with keystore
-                let sign_result = encrypted_keystore.secure_sign(
-                    &sui_address, 
-                    &data, 
-                    &password, 
-                    intent
-                )?;
-                
-                // Clear keys from memory (for security)
-                encrypted_keystore.clear_all_keys()?;
-                
-                // Return result
-                CommandOutput::SecureSignData(sign_result)
+                CommandOutput::SignEncryptedData(sign_result)
             }
             KeyToolCommand::Unpack { keypair } => {
                 let keypair = SuiKeyPair::decode_base64(&keypair)
@@ -1563,87 +1537,12 @@ impl KeyToolCommand {
                 
                 CommandOutput::Export(exported_key)
             }
-            KeyToolCommand::ListEncrypted {
-                path,
-                password,
-                sort_by_alias,
-            } => {                
-                // Handle password
-                let password = match password {
-                    Some(pwd) => pwd,
-                    None => {
-                        print!("Enter password: ");
-                        io::stdout().flush()?;
-                        rpassword::read_password()?
-                    }
-                };
-                
-                // Load keystore
-                let mut encrypted_keystore = EncryptedFileBasedKeystore::new(&path, &password, true)?; // Set keep_in_memory to true to access public keys
-                
-                // Extract addresses and public keys from keystore
-                let addresses = encrypted_keystore.addresses();
-                let public_keys = encrypted_keystore.keys();
-                
-                // Create a map of address to public key
-                let mut address_to_pubkey = std::collections::HashMap::new();
-                for pk in public_keys {
-                    let address: SuiAddress = (&pk).into();
-                    address_to_pubkey.insert(address, pk);
-                }
-                
-                // List keys
-                let mut keys = Vec::new();
-                for address in addresses {
-                    if let Some(pk) = address_to_pubkey.get(&address) {
-                        // Create Key object from the actual public key
-                        let mut key = Key::from(pk.clone());
-                        
-                        // Try to set alias if available
-                        if let Ok(alias) = encrypted_keystore.get_alias_by_address(&address) {
-                            key.alias = Some(alias);
-                        }
-                        
-                        keys.push(key);
-                    } else {
-                        // Fallback if public key not in memory but address is known
-                        // (should rarely happen with keep_in_memory=true)
-                        let key = Key {
-                            alias: encrypted_keystore.get_alias_by_address(&address).ok(),
-                            sui_address: address,
-                            public_base64_key: String::from("unavailable"),
-                            key_scheme: String::from("unavailable"),
-                            flag: 0,
-                            mnemonic: None,
-                            peer_id: None,
-                        };
-                        keys.push(key);
-                    }
-                }
-                
-                // Sort keys by alias if requested
-                if sort_by_alias {
-                    keys.sort_by(|a, b| {
-                        let a_alias = a.alias.clone().unwrap_or_default();
-                        let b_alias = b.alias.clone().unwrap_or_default();
-                        a_alias.cmp(&b_alias)
-                    });
-                }
-                
-                // Clean up memory for security
-                encrypted_keystore.clear_all_keys()?;
-                
-                CommandOutput::List(keys)
-            }
-            KeyToolCommand::GenerateEncryptedKey {
+            KeyToolCommand::GenerateEncrypted {
                 output_dir,
                 password,
                 key_scheme,
             } => {
-                // Create output directory if it doesn't exist
-                fs::create_dir_all(&output_dir)?;
-
-                // Confirm password
+                // Password confirmation
                 let password = match password {
                     Some(pwd) => pwd,
                     None => {
@@ -1661,33 +1560,39 @@ impl KeyToolCommand {
                 };
 
                 // Generate new keypair
-                let (sui_address, keypair, _, _) = generate_new_key(key_scheme, None, None)?;
+                let (sui_address, keypair, scheme, _) = generate_new_key(key_scheme, None, None)?;
                 
-                // Create temporary keystore (for purpose of creating key file only)
-                let temp_keystore_path = output_dir.join(format!("temp_{}", sui_address));
-                let mut keystore = EncryptedFileBasedKeystore::new(&temp_keystore_path, &password, false)?;
+                println!("Generated address: {}", sui_address);
+                println!("Key type: {}", scheme);
                 
-                // Encrypt and save key (automatically creates .encrypted file)
-                keystore.add_key_with_password(None, keypair, &password)?;
+                // Extract required information
+                let public_key_base64 = keypair.public().encode_base64();
+                let flag = keypair.public().flag();
+                let peer_id = anemo_styling(&keypair.public());
                 
-                // Check created file path
-                let encrypted_file = output_dir.join(format!("{}.encrypted", sui_address));
+                // Create encrypted key file
+                let (encrypted_file_path, _) = encrypted_key_utils::create_encrypted_key_file(
+                    &output_dir, 
+                    &password, 
+                    &keypair
+                )?;
                 
-                // Delete temporary keystore file
-                if temp_keystore_path.exists() {
-                    let _ = fs::remove_file(&temp_keystore_path);
-                }
+                // Return generated key info
+                let key = Key {
+                    alias: None,
+                    sui_address,
+                    public_base64_key: public_key_base64,
+                    key_scheme: scheme.to_string(),
+                    flag,
+                    mnemonic: None,
+                    peer_id,
+                };
                 
-                // Delete alias file
-                let alias_file = temp_keystore_path.with_extension("aliases");
-                if alias_file.exists() {
-                    let _ = fs::remove_file(&alias_file);
-                }
+                // Display file information
+                println!("Encrypted key file created: {}", encrypted_file_path.display());
+                println!("Use this file with the --key_file parameter");
                 
-                CommandOutput::Success(format!(
-                    "Encrypted key file created successfully: {:?}",
-                    encrypted_file
-                ))
+                CommandOutput::Generate(key)
             }
         });
 
@@ -1760,7 +1665,7 @@ impl Display for CommandOutput {
             CommandOutput::Success(message) => {
                 write!(formatter, "{}", message)
             }
-            CommandOutput::SecureSignData(s) => {
+            CommandOutput::SignEncryptedData(s) => {
                 writeln!(
                     formatter,
                     "{{\n  \"digest\": \"{}\",\n  \"signature\": \"{}\",\n  \"signed_transaction\": \"{}\"\n}}",
@@ -1797,7 +1702,7 @@ impl CommandOutput {
             CommandOutput::ZkLoginSigVerify(_) => {
                 println!("{}", self);
             }
-            CommandOutput::SecureSignData(_) => {
+            CommandOutput::SignEncryptedData(_s) => {
                 println!("{}", self);
             }
             _ => {
@@ -1854,7 +1759,7 @@ impl Debug for CommandOutput {
             CommandOutput::Success(message) => {
                 writeln!(f, "{}", message)
             }
-            CommandOutput::SecureSignData(s) => {
+            CommandOutput::SignEncryptedData(s) => {
                 writeln!(
                     f,
                     "{{\n  \"digest\": \"{}\",\n  \"signature\": \"{}\",\n  \"signed_transaction\": \"{}\"\n}}",

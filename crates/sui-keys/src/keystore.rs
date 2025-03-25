@@ -24,17 +24,23 @@ use sui_types::crypto::{
 };
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, NONCE_LEN};
 use ring::pbkdf2;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::rngs::OsRng;
 use std::num::NonZeroU32;
 use hex;
 use sui_types::crypto::DefaultHash;
 use sui_types::transaction::{Transaction, TransactionData};
 use fastcrypto::hash::HashFunction;
+use fastcrypto::traits::KeyPair;
+
+// Encryption-related constants
+const PBKDF2_ITERATIONS: u32 = 100_000;
+const SALT_SIZE: usize = 16;
+const KEY_SIZE: usize = 32;
 
 /// Data structure for secure signing results using encrypted keystore
 #[derive(Serialize, Deserialize, Debug)]
-pub struct SecureSignData {
+pub struct SignEncryptedData {
     /// SUI address of the signer
     pub sui_address: SuiAddress,
     
@@ -464,9 +470,6 @@ impl FileBasedKeystore {
                 }
             }
             
-            // Debug log
-            eprintln!("Saving aliases to: {:?}", aliases_path);
-            
             // Save file
             fs::write(aliases_path, aliases_store)?;
         }
@@ -693,8 +696,6 @@ mod tests {
 pub struct EncryptedKeyData {
     /// Encryption version (for future version upgrades)
     pub version: u8,
-    /// Encrypted key data (Base64 encoded)
-    pub encrypted_data: String,
     /// IV used for encryption (Base64 encoded)
     pub iv: String,
     /// Salt used for key derivation from password (Base64 encoded)
@@ -720,6 +721,117 @@ pub struct EncryptedFileBasedKeystore {
     keep_in_memory: bool,
 }
 
+impl AccountKeystore for EncryptedFileBasedKeystore {
+    fn add_key(&mut self, alias: Option<String>, keypair: SuiKeyPair) -> Result<(), anyhow::Error> {
+        // Call add_key_with_password with an empty password
+        self.add_key_with_password(alias, keypair, "")
+    }
+
+    fn keys(&self) -> Vec<PublicKey> {
+        // Return public keys from memory + public keys from encrypted storage in keystore
+        let mut result: Vec<PublicKey> = self.keys.values().map(|key| key.public()).collect();
+        
+        // Add alias public keys (include keys not in memory)
+        for alias in self.aliases.values() {
+            if let Ok(pubkey) = PublicKey::decode_base64(&alias.public_key_base64) {
+                if !result.iter().any(|k| k == &pubkey) {
+                    result.push(pubkey);
+                }
+            }
+        }
+        
+        result
+    }
+
+    fn get_key(&self, address: &SuiAddress) -> Result<&SuiKeyPair, anyhow::Error> {
+        // This implementation can only return keys in memory.
+        match self.keys.get(address) {
+            Some(key) => Ok(key),
+            None => Err(anyhow!("Key not found in memory. Use get_key_with_password to load it from encrypted storage.")),
+        }
+    }
+
+    fn sign_hashed(&self, address: &SuiAddress, msg: &[u8]) -> Result<Signature, signature::Error> {
+        // This implementation can only use keys in memory.
+        // For actual use, a prompt for entering the password is needed.
+        if let Some(key) = self.keys.get(address) {
+            Ok(Signature::new_hashed(msg, key))
+        } else {
+            Err(signature::Error::from_source(format!("Cannot find key for address: [{address}] - Please use get_key_with_password first")))
+        }
+    }
+    
+    fn sign_secure<T>(
+        &self,
+        address: &SuiAddress,
+        msg: &T,
+        intent: Intent,
+    ) -> Result<Signature, signature::Error>
+    where
+        T: Serialize,
+    {
+        // This implementation can only use keys in memory.
+        if let Some(key) = self.keys.get(address) {
+            Ok(Signature::new_secure(&IntentMessage::new(intent, msg), key))
+        } else {
+            Err(signature::Error::from_source(format!("Cannot find key for address: [{address}] - Please use get_key_with_password first")))
+        }
+    }
+
+    fn aliases(&self) -> Vec<&Alias> {
+        self.aliases.values().collect()
+    }
+
+    fn addresses_with_alias(&self) -> Vec<(&SuiAddress, &Alias)> {
+        self.aliases.iter().collect::<Vec<_>>()
+    }
+
+    fn aliases_mut(&mut self) -> Vec<&mut Alias> {
+        self.aliases.values_mut().collect()
+    }
+
+    fn get_alias_by_address(&self, address: &SuiAddress) -> Result<String, anyhow::Error> {
+        match self.aliases.get(address) {
+            Some(alias) => Ok(alias.alias.clone()),
+            None => bail!("Cannot find alias for address {address}"),
+        }
+    }
+
+    fn get_address_by_alias(&self, alias: String) -> Result<&SuiAddress, anyhow::Error> {
+        self.addresses_with_alias()
+            .iter()
+            .find(|x| x.1.alias == alias)
+            .ok_or_else(|| anyhow!("Cannot resolve alias {alias} to an address"))
+            .map(|x| x.0)
+    }
+
+    fn create_alias(&self, alias: Option<String>) -> Result<String, anyhow::Error> {
+        match alias {
+            Some(a) if self.alias_exists(&a) => {
+                bail!("Alias {a} already exists. Please choose another alias.")
+            }
+            Some(a) => validate_alias(&a),
+            None => Ok(random_name(
+                &self
+                    .alias_names()
+                    .into_iter()
+                    .map(|x| x.to_string())
+                    .collect::<HashSet<_>>(),
+            )),
+        }
+    }
+
+    fn update_alias(
+        &mut self,
+        old_alias: &str,
+        new_alias: Option<&str>,
+    ) -> Result<String, anyhow::Error> {
+        let new_alias_name = self.update_alias_value(old_alias, new_alias)?;
+        self.save_aliases()?;
+        Ok(new_alias_name)
+    }
+}
+
 impl EncryptedFileBasedKeystore {
     /// Create a new encrypted keystore
     pub fn new(path: &PathBuf, password: &str, keep_in_memory: bool) -> Result<Self, anyhow::Error> {
@@ -730,50 +842,32 @@ impl EncryptedFileBasedKeystore {
             keep_in_memory,
         };
         
-        // Load keystore from file system
-        if let Some(path) = &keystore.path {
-            let key_dir = path.parent().ok_or_else(|| anyhow!("Invalid keystore path"))?;
-            if !key_dir.exists() {
-                fs::create_dir_all(key_dir)?;
+        // If the provided path is a directory, return an error
+        if path.is_dir() {
+            return Err(anyhow!("The provided path is a directory, please provide a file path: {}", path.display()));
+        }
+        
+        // Only process files that exist and have the .encrypted extension
+        if path.exists() && path.extension().map_or(false, |ext| ext == "encrypted") {
+            let (address, keypair) = keystore.load_and_decrypt_key(path, password)
+                .with_context(|| format!("Failed to decrypt key file: {}", path.display()))?;
+                
+            // If the memory storage option is enabled, store the decrypted key in memory
+            if keystore.keep_in_memory {
+                keystore.keys.insert(address, keypair);
             }
             
-            // Check if there are already encrypted key files and load
-            if key_dir.exists() && key_dir.is_dir() {
-                for entry in fs::read_dir(key_dir)? {
-                    let entry = entry?;
-                    let file_path = entry.path();
-                    
-                    // Only process files with .encrypted extension
-                    if file_path.extension().map_or(false, |ext| ext == "encrypted") {
-                        let (address, keypair) = keystore.load_and_decrypt_key(&file_path, password)
-                            .with_context(|| format!("Failed to decrypt key file: {}", file_path.display()))?;
-                            
-                        // If memory storage option is turned on, store decrypted key in memory
-                        if keystore.keep_in_memory {
-                            keystore.keys.insert(address, keypair);
-                        }
-                    }
-                }
-            }
-
-            // Try to load alias file
-            let mut aliases_path = path.clone();
-            aliases_path.set_extension("aliases");
+            // Try to load the aliases file
+            let aliases_path = path.with_extension("aliases");
             
             if aliases_path.exists() {
                 let file = File::open(&aliases_path).with_context(|| {
-                    format!(
-                        "Cannot open alias file at path: {}",
-                        aliases_path.display()
-                    )
+                    format!("Failed to open aliases file: {}", aliases_path.display())
                 })?;
                 
                 let reader = BufReader::new(file);
                 let alias_vec: Vec<Alias> = serde_json::from_reader(reader).with_context(|| {
-                    format!(
-                        "Cannot deserialize aliases from file: {}",
-                        aliases_path.display()
-                    )
+                    format!("Failed to deserialize aliases file: {}", aliases_path.display())
                 })?;
 
                 // Get alias information
@@ -813,60 +907,21 @@ impl EncryptedFileBasedKeystore {
             let mut key_path = key_dir.clone();
             key_path.push(format!("{}.encrypted", address));
             
-            // Debug log for file path
-            eprintln!("Saving encrypted key to: {:?}", key_path);
-            
             // Generate encryption parameters
-            let mut salt = [0u8; 16];
+            let mut salt = [0u8; SALT_SIZE];
             OsRng.fill_bytes(&mut salt);
             
             let mut iv = [0u8; NONCE_LEN];
             OsRng.fill_bytes(&mut iv);
             
-            // Derive encryption key from password
-            const ITERATIONS: u32 = 100_000; // Enough iterations
-            let iterations = NonZeroU32::new(ITERATIONS).unwrap();
-            
-            let mut derived_key = [0u8; 32]; // AES-256 key size
-            pbkdf2::derive(
-                pbkdf2::PBKDF2_HMAC_SHA256, 
-                iterations, 
+            // Encryption and saving logic
+            self.encrypt_keypair_to_file(
+                keypair, 
+                password, 
+                &key_path, 
                 &salt, 
-                password.as_bytes(), 
-                &mut derived_key
-            );
-            
-            // Serialize key pair
-            let serialized_keypair = keypair.encode_base64();
-            
-            // Encrypt
-            let unbound_key = UnboundKey::new(&aead::AES_256_GCM, &derived_key)
-                .map_err(|_| anyhow!("Failed to create encryption key"))?;
-            let less_safe_key = LessSafeKey::new(unbound_key);
-            
-            let nonce = Nonce::assume_unique_for_key(iv);
-            let aad = Aad::empty(); // No additional authentication data
-            
-            let mut serialized_data = serialized_keypair.as_bytes().to_vec();
-            less_safe_key
-                .seal_in_place_append_tag(nonce, aad, &mut serialized_data)
-                .map_err(|_| anyhow!("Encryption failed"))?;
-            
-            // Create encrypted data structure
-            let encrypted_data = EncryptedKeyData {
-                version: 1,
-                encrypted_data: BASE64.encode(&serialized_data),
-                iv: BASE64.encode(&iv),
-                salt: BASE64.encode(&salt),
-                cipher: "aes-256-gcm".to_string(),
-                iterations: ITERATIONS,
-                address: address.to_string(),
-                ciphertext: BASE64.encode(&serialized_data),
-            };
-            
-            // Serialize to JSON and save to file
-            let json = serde_json::to_string_pretty(&encrypted_data)?;
-            fs::write(key_path, json)?;
+                &iv
+            )?;
             
             Ok(())
         } else {
@@ -874,36 +929,121 @@ impl EncryptedFileBasedKeystore {
         }
     }
     
-    /// Decrypt encrypted key file with password
-    fn load_and_decrypt_key(&self, key_path: &Path, password: &str) -> Result<(SuiAddress, SuiKeyPair), anyhow::Error> {
-        // Read encrypted data from file
-        let json = fs::read_to_string(key_path)?;
-        let encrypted_data: EncryptedKeyData = serde_json::from_str(&json)?;
+    /// Internal function to encrypt and save keypair to file (improved reusability)
+    fn encrypt_keypair_to_file(
+        &self,
+        keypair: &SuiKeyPair,
+        password: &str,
+        file_path: &PathBuf,
+        salt: &[u8],
+        iv: &[u8; NONCE_LEN]
+    ) -> Result<(), anyhow::Error> {
+        // Derive encryption key from password
+        let iterations = NonZeroU32::new(PBKDF2_ITERATIONS).unwrap();
         
-        // Only version 1 is supported
+        let mut derived_key = [0u8; KEY_SIZE]; // AES-256 key size
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256, 
+            iterations, 
+            salt, 
+            password.as_bytes(), 
+            &mut derived_key
+        );
+        
+        // Serialize key pair
+        let serialized_keypair = keypair.encode_base64();
+        
+        // Encrypt
+        let unbound_key = UnboundKey::new(&aead::AES_256_GCM, &derived_key)
+            .map_err(|_| anyhow!("Failed to create encryption key"))?;
+        let less_safe_key = LessSafeKey::new(unbound_key);
+        
+        let nonce = Nonce::assume_unique_for_key(*iv);
+        let aad = Aad::empty(); // No additional authentication data
+        
+        let mut serialized_data = serialized_keypair.as_bytes().to_vec();
+        less_safe_key
+            .seal_in_place_append_tag(nonce, aad, &mut serialized_data)
+            .map_err(|_| anyhow!("Encryption failed"))?;
+        
+        // Address for verification
+        let address: SuiAddress = (&keypair.public()).into();
+        
+        // Create encrypted data structure
+        let encrypted_data = EncryptedKeyData {
+            version: 1,
+            iv: BASE64.encode(iv),
+            salt: BASE64.encode(salt),
+            cipher: "aes-256-gcm".to_string(),
+            iterations: PBKDF2_ITERATIONS,
+            address: address.to_string(),
+            ciphertext: BASE64.encode(&serialized_data),
+        };
+        
+        // Serialize to JSON and save to file
+        let json = serde_json::to_string_pretty(&encrypted_data)?;
+        fs::write(file_path, json)?;
+        
+        Ok(())
+    }
+    
+    /// Decrypt encrypted key file with password - made public for external access
+    pub fn load_and_decrypt_key(&self, key_path: &Path, password: &str) -> Result<(SuiAddress, SuiKeyPair), anyhow::Error> {
+        // Load encrypted data
+        let encrypted_data = self.load_encrypted_key_data(key_path)?;
+        
+        // Decrypt keypair
+        let keypair = self.decrypt_keypair(&encrypted_data, password)?;
+        
+        // Verify address
+        let address = self.verify_key_address(&keypair, &encrypted_data)?;
+        
+        Ok((address, keypair))
+    }
+    
+    /// Internal function to load EncryptedKeyData from file
+    fn load_encrypted_key_data(&self, key_path: &Path) -> Result<EncryptedKeyData, anyhow::Error> {
+        // Read encrypted data from file
+        let json = fs::read_to_string(key_path)
+            .map_err(|e| anyhow!("Failed to read key file: {}", e))?;
+        
+        // Parse into encrypted data structure
+        let encrypted_data: EncryptedKeyData = serde_json::from_str(&json)
+            .map_err(|e| anyhow!("Invalid key file format: {}", e))?;
+        
+        // Verify encryption version
         if encrypted_data.version != 1 {
             return Err(anyhow!("Unsupported encryption version: {}", encrypted_data.version));
         }
         
-        // Only aes-256-gcm is supported
+        Ok(encrypted_data)
+    }
+    
+    /// Internal function to decrypt keypair from EncryptedKeyData
+    fn decrypt_keypair(&self, encrypted_data: &EncryptedKeyData, password: &str) -> Result<SuiKeyPair, anyhow::Error> {
+        // Prepare decryption parameters
         if encrypted_data.cipher != "aes-256-gcm" {
             return Err(anyhow!("Unsupported cipher: {}", encrypted_data.cipher));
         }
         
-        // Base64 decode
-        let ciphertext = BASE64.decode(&encrypted_data.ciphertext)?;
-        let iv = BASE64.decode(&encrypted_data.iv)?;
-        let salt = BASE64.decode(&encrypted_data.salt)?;
+        let ciphertext = BASE64.decode(&encrypted_data.ciphertext)
+            .map_err(|e| anyhow!("Failed to decode ciphertext: {}", e))?;
+        
+        let iv = BASE64.decode(&encrypted_data.iv)
+            .map_err(|e| anyhow!("Failed to decode IV: {}", e))?;
+        
+        let salt = BASE64.decode(&encrypted_data.salt)
+            .map_err(|e| anyhow!("Failed to decode salt: {}", e))?;
         
         if iv.len() != NONCE_LEN {
             return Err(anyhow!("Invalid IV length"));
         }
         
-        // Derive encryption key from password
+        // Derive key from password
         let iterations = NonZeroU32::new(encrypted_data.iterations)
             .ok_or_else(|| anyhow!("Invalid iteration count"))?;
         
-        let mut derived_key = [0u8; 32];
+        let mut derived_key = [0u8; KEY_SIZE];
         pbkdf2::derive(
             pbkdf2::PBKDF2_HMAC_SHA256, 
             iterations, 
@@ -912,34 +1052,50 @@ impl EncryptedFileBasedKeystore {
             &mut derived_key
         );
         
-        // Decrypt
-        let unbound_key = UnboundKey::new(&aead::AES_256_GCM, &derived_key)
-            .map_err(|_| anyhow!("Failed to create decryption key"))?;
-        let less_safe_key = LessSafeKey::new(unbound_key);
+        // Create a scope to ensure sensitive memory is zeroed
+        let result = {
+            // Decrypt
+            let unbound_key = UnboundKey::new(&aead::AES_256_GCM, &derived_key)
+                .map_err(|_| anyhow!("Failed to create decryption key"))?;
+            let less_safe_key = LessSafeKey::new(unbound_key);
+            
+            let mut nonce_bytes = [0u8; NONCE_LEN];
+            nonce_bytes.copy_from_slice(&iv);
+            let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+            let aad = Aad::empty();
+            
+            let mut ciphertext_copy = ciphertext.clone();
+            let plaintext = less_safe_key
+                .open_in_place(nonce, aad, &mut ciphertext_copy)
+                .map_err(|_| anyhow!("Decryption failed - wrong password or corrupted data"))?;
+            
+            // Restore keypair
+            let plaintext_str = std::str::from_utf8(plaintext)
+                .map_err(|e| anyhow!("Failed to convert key data: {}", e))?;
+            
+            SuiKeyPair::decode_base64(plaintext_str)
+                .map_err(|e| anyhow!("Failed to restore keypair: {}", e))
+        };
         
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        nonce_bytes.copy_from_slice(&iv);
-        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
-        let aad = Aad::empty();
+        // Zero out sensitive data from memory
+        derived_key.iter_mut().for_each(|b| *b = 0);
         
-        let mut ciphertext_copy = ciphertext.clone();
-        let plaintext = less_safe_key
-            .open_in_place(nonce, aad, &mut ciphertext_copy)
-            .map_err(|_| anyhow!("Decryption failed - wrong password or corrupted data"))?;
-        
-        // Restore key pair
-        let plaintext_str = std::str::from_utf8(plaintext)?;
-        let keypair = SuiKeyPair::decode_base64(plaintext_str)?;
-        
-        // Address verification
-        let address: SuiAddress = (&keypair.public()).into();
+        result
+    }
+    
+    /// Verify keypair address matches address in encrypted data
+    fn verify_key_address(&self, keypair: &SuiKeyPair, encrypted_data: &EncryptedKeyData) -> Result<SuiAddress, anyhow::Error> {
+        let address_from_keypair: SuiAddress = (&keypair.public()).into();
         let expected_address = parse_sui_address(&encrypted_data.address)?;
         
-        if address != expected_address {
-            return Err(anyhow!("Address mismatch after decryption"));
+        if address_from_keypair != expected_address {
+            return Err(anyhow!(
+                "Address mismatch: file stored address {}, actual key address {}", 
+                expected_address, address_from_keypair
+            ));
         }
         
-        Ok((address, keypair))
+        Ok(address_from_keypair)
     }
     
     /// Add key to keystore (encrypt and save)
@@ -1007,7 +1163,7 @@ impl EncryptedFileBasedKeystore {
     
     /// Remove all keys from memory (for security)
     pub fn clear_all_keys(&mut self) -> Result<(), anyhow::Error> {
-        self.keys.clear();
+        self.clear_sensitive_data();
         Ok(())
     }
     
@@ -1086,9 +1242,6 @@ impl EncryptedFileBasedKeystore {
                 }
             }
             
-            // Debug log
-            eprintln!("Saving aliases to: {:?}", aliases_path);
-            
             // Save file
             fs::write(aliases_path, aliases_store)?;
         }
@@ -1125,179 +1278,85 @@ impl EncryptedFileBasedKeystore {
         Ok(address)
     }
 
-    /// Convenience function for signing
-    /// Sign transaction data and return signature information
-    pub fn secure_sign(
+    /// Common signature logic extracted as internal function
+    fn sign_transaction_data_internal(
+        keypair: &SuiKeyPair,
+        data: &str, 
+        intent: Option<Intent>
+    ) -> Result<SignEncryptedData, anyhow::Error> {
+        // Decode Base64 data
+        let decoded_data = BASE64.decode(data)
+            .map_err(|e| anyhow!("Invalid base64 data: {}", e))?;
+        
+        // Deserialize transaction data
+        let tx_data: TransactionData = bcs::from_bytes(&decoded_data)
+            .map_err(|e| anyhow!("Failed to deserialize transaction data: {}", e))?;
+        
+        // Set intent
+        let intent_obj = intent.unwrap_or_else(Intent::sui_transaction);
+        let intent_msg = IntentMessage::new(intent_obj.clone(), tx_data);
+        
+        // Create signature
+        let signature = Signature::new_secure(&intent_msg, keypair);
+        
+        // Calculate digest
+        let intent_msg_bytes = bcs::to_bytes(&intent_msg)?;
+        let mut hasher = DefaultHash::default();
+        hasher.update(&intent_msg_bytes);
+        let digest = hasher.finalize().digest;
+        
+        // Create signed transaction
+        let transaction = Transaction::from_data(intent_msg.value.clone(), vec![signature.clone()]);
+        let signed_tx_bytes = bcs::to_bytes(&transaction)?;
+        
+        // Construct result
+        let sui_address: SuiAddress = (&keypair.public()).into();
+        let sign_result = SignEncryptedData {
+            sui_address,
+            raw_tx_data: data.to_string(),
+            intent: intent_obj,
+            raw_intent_msg: BASE64.encode(&intent_msg_bytes),
+            digest: BASE64.encode(digest),
+            sui_signature: signature.encode_base64(),
+            signed_transaction: BASE64.encode(signed_tx_bytes),
+        };
+        
+        Ok(sign_result)
+    }
+
+    /// Convenience function for signing transaction data with an encrypted key
+    /// Loads the key using the provided password, signs the data, and returns signature information
+    pub fn sign_encrypted(
         &mut self, 
         address: &SuiAddress, 
         data: &str, 
         password: &str,
         intent: Option<Intent>
-    ) -> Result<SecureSignData, anyhow::Error> {
+    ) -> Result<SignEncryptedData, anyhow::Error> {
         // Load key into memory (decrypt with password)
         self.get_key_with_password(address, password)?;
         
-        // Set intent
-        let intent = intent.unwrap_or_else(Intent::sui_transaction);
-        let intent_clone = intent.clone();
+        // Get key from memory
+        let keypair = self.get_key(address)?;
         
-        // Decode transaction data
-        let msg: TransactionData = bcs::from_bytes(&BASE64.decode(data)
-            .map_err(|e| anyhow!("Cannot deserialize transaction data: {:?}", e))?)?;
+        // Use common signature logic
+        let result = Self::sign_transaction_data_internal(keypair, data, intent);
         
-        // Generate intent message
-        let intent_msg = IntentMessage::new(intent, msg);
-        let raw_intent_msg = BASE64.encode(bcs::to_bytes(&intent_msg)?);
-        
-        // Calculate hash
-        let mut hasher = DefaultHash::default();
-        hasher.update(bcs::to_bytes(&intent_msg)?);
-        let digest = hasher.finalize().digest;
-        
-        // Sign
-        let sui_signature = self.sign_secure(
-            address, 
-            &intent_msg.value, 
-            intent_msg.intent
-        )?;
-        
-        // Create signed transaction
-        let signed_tx = Transaction::from_data(
-            intent_msg.value, 
-            vec![sui_signature.clone()]
-        );
-        let signed_tx_bytes = bcs::to_bytes(&signed_tx)?;
-        let signed_tx_base64 = BASE64.encode(signed_tx_bytes);
-        
-        // Optionally remove key from memory after signing
-        // self.clear_all_keys()?;
-        
-        // Return result
-        Ok(SecureSignData {
-            sui_address: *address,
-            raw_tx_data: data.to_owned(),
-            intent: intent_clone,
-            raw_intent_msg,
-            digest: BASE64.encode(digest),
-            sui_signature: sui_signature.encode_base64(),
-            signed_transaction: signed_tx_base64,
-        })
-    }
-}
-
-// AccountKeystore trait implementation
-impl AccountKeystore for EncryptedFileBasedKeystore {
-    fn sign_hashed(&self, address: &SuiAddress, msg: &[u8]) -> Result<Signature, signature::Error> {
-        // This implementation can only use keys in memory.
-        // For actual use, a prompt for entering the password is needed.
-        if let Some(key) = self.keys.get(address) {
-            Ok(Signature::new_hashed(msg, key))
-        } else {
-            Err(signature::Error::from_source(format!("Cannot find key for address: [{address}] - Please use get_key_with_password first")))
-        }
-    }
-    
-    fn sign_secure<T>(
-        &self,
-        address: &SuiAddress,
-        msg: &T,
-        intent: Intent,
-    ) -> Result<Signature, signature::Error>
-    where
-        T: Serialize,
-    {
-        // This implementation can only use keys in memory.
-        if let Some(key) = self.keys.get(address) {
-            Ok(Signature::new_secure(&IntentMessage::new(intent, msg), key))
-        } else {
-            Err(signature::Error::from_source(format!("Cannot find key for address: [{address}] - Please use get_key_with_password first")))
-        }
-    }
-
-    fn add_key(&mut self, _alias: Option<String>, _keypair: SuiKeyPair) -> Result<(), anyhow::Error> {
-        // This method cannot be used without a password
-        Err(anyhow!("For EncryptedFileBasedKeystore, use add_key_with_password instead"))
-    }
-
-    fn keys(&self) -> Vec<PublicKey> {
-        // Return public keys from memory + public keys from encrypted storage in keystore
-        let mut result: Vec<PublicKey> = self.keys.values().map(|key| key.public()).collect();
-        
-        // Add alias public keys (include keys not in memory)
-        for alias in self.aliases.values() {
-            if let Ok(pubkey) = PublicKey::decode_base64(&alias.public_key_base64) {
-                if !result.iter().any(|k| k == &pubkey) {
-                    result.push(pubkey);
-                }
-            }
+        // Clear key from memory if not configured to keep keys in memory
+        if !self.keep_in_memory {
+            self.keys.remove(address);
         }
         
         result
     }
 
-    fn get_key(&self, address: &SuiAddress) -> Result<&SuiKeyPair, anyhow::Error> {
-        // This implementation can only return keys in memory.
-        match self.keys.get(address) {
-            Some(key) => Ok(key),
-            None => Err(anyhow!("Key not found in memory. Use get_key_with_password to load it from encrypted storage.")),
-        }
-    }
-
-    fn aliases(&self) -> Vec<&Alias> {
-        self.aliases.values().collect()
-    }
-
-    fn addresses_with_alias(&self) -> Vec<(&SuiAddress, &Alias)> {
-        self.aliases.iter().collect::<Vec<_>>()
-    }
-
-    fn aliases_mut(&mut self) -> Vec<&mut Alias> {
-        self.aliases.values_mut().collect()
-    }
-
-    fn get_alias_by_address(&self, address: &SuiAddress) -> Result<String, anyhow::Error> {
-        match self.aliases.get(address) {
-            Some(alias) => Ok(alias.alias.clone()),
-            None => bail!("Cannot find alias for address {address}"),
-        }
-    }
-
-    fn get_address_by_alias(&self, alias: String) -> Result<&SuiAddress, anyhow::Error> {
-        self.addresses_with_alias()
-            .iter()
-            .find(|x| x.1.alias == alias)
-            .ok_or_else(|| anyhow!("Cannot resolve alias {alias} to an address"))
-            .map(|x| x.0)
-    }
-
-    fn create_alias(&self, alias: Option<String>) -> Result<String, anyhow::Error> {
-        match alias {
-            Some(a) if self.alias_exists(&a) => {
-                bail!("Alias {a} already exists. Please choose another alias.")
-            }
-            Some(a) => validate_alias(&a),
-            None => Ok(random_name(
-                &self
-                    .alias_names()
-                    .into_iter()
-                    .map(|x| x.to_string())
-                    .collect::<HashSet<_>>(),
-            )),
-        }
-    }
-
-    fn update_alias(
-        &mut self,
-        old_alias: &str,
-        new_alias: Option<&str>,
-    ) -> Result<String, anyhow::Error> {
-        let new_alias_name = self.update_alias_value(old_alias, new_alias)?;
-        self.save_aliases()?;
-        Ok(new_alias_name)
+    /// Clear all sensitive data from memory for security
+    pub fn clear_sensitive_data(&mut self) {
+        self.keys.clear();
     }
 }
 
-// Helper function to parse SuiAddress from string
+/// Helper function to parse SuiAddress from string
 fn parse_sui_address(s: &str) -> Result<SuiAddress, anyhow::Error> {
     // Check if string starts with 0x
     let s = if s.starts_with("0x") { &s[2..] } else { s };
@@ -1311,16 +1370,132 @@ fn parse_sui_address(s: &str) -> Result<SuiAddress, anyhow::Error> {
         .map_err(|e| anyhow!("Failed to convert bytes to SuiAddress: {}", e))
 }
 
-// Helper function to parse a private key string to SuiKeyPair
-pub fn keypair_from_str(s: &str) -> Result<SuiKeyPair, anyhow::Error> {
-    // Bech32 decoding support etc. This function needs to be implemented for actual use.
-    // For now, assume Base64 encoded key
-    if s.starts_with("suiprivkey") {
-        // TODO: Implement Bech32
-        return Err(anyhow!("Bech32 format not implemented yet"));
+/// Utility functions for encrypted key files
+pub mod encrypted_key_utils {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// Load EncryptedKeyData from file
+    pub fn load_encrypted_key_data(key_file: &Path) -> Result<EncryptedKeyData, anyhow::Error> {
+        // Reuse method from EncryptedFileBasedKeystore
+        EncryptedFileBasedKeystore::default().load_encrypted_key_data(key_file)
+    }
+
+    /// Decrypt keypair from EncryptedKeyData
+    pub fn decrypt_key_pair(encrypted_data: &EncryptedKeyData, password: &str) -> Result<SuiKeyPair, anyhow::Error> {
+        // Reuse method from EncryptedFileBasedKeystore
+        EncryptedFileBasedKeystore::default().decrypt_keypair(encrypted_data, password)
+    }
+
+    /// Verify keypair address matches address in encrypted data
+    pub fn verify_key_address(keypair: &SuiKeyPair, encrypted_data: &EncryptedKeyData) -> Result<SuiAddress, anyhow::Error> {
+        // Reuse method from EncryptedFileBasedKeystore
+        EncryptedFileBasedKeystore::default().verify_key_address(keypair, encrypted_data)
     }
     
-    // Assume Base64 encoded key
-    SuiKeyPair::decode_base64(s)
-        .map_err(|e| anyhow!("Failed to decode private key: {}", e))
+    /// Sign transaction data with keypair
+    pub fn sign_transaction_data(
+        keypair: &SuiKeyPair, 
+        data: &str, 
+        intent: Option<Intent>
+    ) -> Result<SignEncryptedData, anyhow::Error> {
+        // Reuse method from EncryptedFileBasedKeystore
+        EncryptedFileBasedKeystore::sign_transaction_data_internal(keypair, data, intent)
+    }
+
+    /// Create a new encrypted key file
+    pub fn create_encrypted_key_file(
+        output_dir: &Path,
+        password: &str,
+        keypair: &SuiKeyPair
+    ) -> Result<(PathBuf, SuiAddress), anyhow::Error> {
+        let sui_address: SuiAddress = (&keypair.public()).into();
+        
+        // Check output directory and create if needed
+        if !output_dir.exists() {
+            fs::create_dir_all(output_dir)
+                .with_context(|| format!("Failed to create output directory: {:?}", output_dir))?;
+        }
+        
+        // Temporary keystore path
+        let temp_keystore_path = output_dir.join("temp_keystore");
+        
+        // Create temporary keystore
+        let mut keystore = EncryptedFileBasedKeystore::new(&PathBuf::from(&temp_keystore_path), password, false)?;
+        
+        // Generate random alias
+        let alias = crate::random_names::random_name(&HashSet::new());
+        
+        // Clone keypair
+        let owned_keypair = match keypair {
+            SuiKeyPair::Ed25519(kp) => SuiKeyPair::Ed25519(kp.copy()),
+            SuiKeyPair::Secp256k1(kp) => SuiKeyPair::Secp256k1(kp.copy()),
+            SuiKeyPair::Secp256r1(kp) => SuiKeyPair::Secp256r1(kp.copy()),
+        };
+        
+        // Add key (encrypts and saves internally)
+        keystore.add_key_with_password(Some(alias), owned_keypair, password)?;
+        
+        // Final file paths
+        let encrypted_file_name = format!("{}.encrypted", sui_address);
+        let encrypted_file_path = output_dir.join(&encrypted_file_name);
+        
+        // Aliases file path
+        let aliases_file_name = format!("{}.aliases", sui_address);
+        let aliases_file_path = output_dir.join(&aliases_file_name);
+        
+        // Move temporary aliases file
+        let temp_aliases_file = temp_keystore_path.with_extension("aliases");
+        if temp_aliases_file.exists() {
+            fs::copy(&temp_aliases_file, &aliases_file_path)?;
+        }
+        
+        // Move temporary keystore file
+        if temp_keystore_path.exists() {
+            fs::copy(&temp_keystore_path, &encrypted_file_path)?;
+            let _ = fs::remove_file(&temp_keystore_path);
+        }
+        
+        // Clean up temporary aliases file
+        if temp_aliases_file.exists() {
+            let _ = fs::remove_file(&temp_aliases_file);
+        }
+        
+        Ok((encrypted_file_path, sui_address))
+    }
+
+    /// Load keypair from keystore using EncryptedFileBasedKeystore
+    pub fn load_key_from_keystore(
+        key_file: &Path,
+        password: &str
+    ) -> Result<(SuiKeyPair, SuiAddress), anyhow::Error> {
+        // Reuse functionality from EncryptedFileBasedKeystore
+        let keystore = EncryptedFileBasedKeystore::default();
+        let (address, keypair) = keystore.load_and_decrypt_key(key_file, password)?;
+        // Return in expected order: keypair first, then address
+        Ok((keypair, address))
+    }
+}
+
+/// Verify password strength to ensure minimum security standards
+pub fn verify_password_strength(password: &str) -> Result<(), anyhow::Error> {
+    if password.len() < 8 {
+        return Err(anyhow!("Password must be at least 8 characters long"));
+    }
+    
+    let has_uppercase = password.chars().any(|c| c.is_uppercase());
+    let has_lowercase = password.chars().any(|c| c.is_lowercase());
+    let has_digit = password.chars().any(|c| c.is_digit(10));
+    let has_special = password.chars().any(|c| !c.is_alphanumeric());
+    
+    let strength_level = [has_uppercase, has_lowercase, has_digit, has_special]
+        .iter()
+        .filter(|&x| *x)
+        .count();
+    
+    if strength_level < 3 {
+        return Err(anyhow!("Password is too weak. It should contain at least 3 of the following: uppercase letters, lowercase letters, digits, special characters"));
+    }
+    
+    Ok(())
 }
