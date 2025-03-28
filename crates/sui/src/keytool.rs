@@ -715,7 +715,7 @@ impl KeyToolCommand {
                     }
                 };
                 
-                // 키페어 생성
+                // Generate a new keypair with the specified key scheme
                 let (sui_address, keypair, scheme, _) = generate_new_key(key_scheme, None, None)?;
                 
                 println!("Generated address: {}", sui_address);

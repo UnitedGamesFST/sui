@@ -66,6 +66,9 @@ pub struct SignEncryptedData {
 }
 
 /// Load EncryptedKeyData from file
+/// Reads and parses an encrypted key file in the standard format (.encrypted).
+/// Only supports version 1 of the encryption format.
+/// Future versions may add support for different encryption algorithms.
 pub fn load_encrypted_key_data(key_file: &Path) -> Result<EncryptedKeyData, anyhow::Error> {
     // Read encrypted data from file
     let json = fs::read_to_string(key_file)
@@ -84,6 +87,9 @@ pub fn load_encrypted_key_data(key_file: &Path) -> Result<EncryptedKeyData, anyh
 }
 
 /// Decrypt keypair from EncryptedKeyData
+/// This function securely decrypts the keypair using the provided password.
+/// It uses PBKDF2 for key derivation and AES-256-GCM for decryption.
+/// Sensitive data is zeroed from memory after use.
 pub fn decrypt_key_pair(encrypted_data: &EncryptedKeyData, password: &str) -> Result<SuiKeyPair, anyhow::Error> {
     // Prepare decryption parameter
     if encrypted_data.cipher != "aes-256-gcm" {
@@ -148,6 +154,9 @@ pub fn decrypt_key_pair(encrypted_data: &EncryptedKeyData, password: &str) -> Re
 }
 
 /// Verify keypair address matches address in encrypted data
+/// This is a critical security check to ensure the decrypted key corresponds
+/// to the expected address stored in the encrypted file, protecting against
+/// potential tampering or corruption of the key file.
 pub fn verify_key_address(keypair: &SuiKeyPair, encrypted_data: &EncryptedKeyData) -> Result<SuiAddress, anyhow::Error> {
     let address_from_keypair: SuiAddress = (&keypair.public()).into();
     let expected_address: SuiAddress = SuiAddress::from_str(&encrypted_data.address)?;
@@ -163,6 +172,8 @@ pub fn verify_key_address(keypair: &SuiKeyPair, encrypted_data: &EncryptedKeyDat
 }
 
 /// Sign transaction data with encrypted key data
+/// This function securely signs transaction data using password-protected encrypted key.
+/// The key is temporarily decrypted in memory and immediately zeroed after signing.
 pub fn sign_encrypted<T>(
     key_data: &EncryptedKeyData,
     password: &str,
@@ -172,7 +183,7 @@ pub fn sign_encrypted<T>(
 where
     T: Serialize,
 {
-    // 복호화 및 주소 검증
+    // Decrypt the key and verify the address
     let keypair = decrypt_key_pair(key_data, password)?;
     verify_key_address(&keypair, key_data)?;
     
@@ -183,6 +194,8 @@ where
 }
 
 /// Create a new encrypted key file
+/// Encrypts the provided keypair with the given password using AES-256-GCM
+/// and writes it to a file named with the SUI address.
 pub fn create_encrypted_key_file(
     output_dir: &Path,
     password: &str,

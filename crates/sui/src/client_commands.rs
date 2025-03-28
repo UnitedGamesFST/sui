@@ -630,6 +630,8 @@ pub struct Opts {
     #[arg(long, required = false)]
     pub serialize_signed_transaction: bool,
     /// Path to the encrypted key file to be used for signing
+    /// This allows using a password-protected key file instead of the keystore
+    /// for enhanced security. When specified, you will be prompted for the password.
     #[arg(long, required = false)]
     pub key_file: Option<PathBuf>,
 }
@@ -3036,16 +3038,16 @@ pub(crate) async fn dry_run_or_execute_or_serialize(
     } else {
         let signature: sui_types::crypto::Signature;
         if let Some(key_file_path) = &opts.key_file {
-            // 키 파일 사용 시 비밀번호 요청
+            // Request password when using key file
             let password = rpassword::prompt_password("Enter password for key file: ")?;
             
-            // 키 파일에서 키페어 로드
+            // Load key data from encrypted key file
             let key_data = encrypted_key::load_encrypted_key_data(&key_file_path)?;
             
-            // 서명 생성
+            // Generate signature with encrypted key
             signature = encrypted_key::sign_encrypted(&key_data, &password, &tx_data, Intent::sui_transaction())?;
         } else {
-            // 기존 키스토어 사용
+            // Use the existing keystore
             signature = context.config.keystore.sign_secure(
                 &tx_data.sender(),
                 &tx_data,
