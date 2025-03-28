@@ -49,7 +49,7 @@ use sui_json_rpc_types::{
     SuiProtocolConfigValue, SuiRawData, SuiTransactionBlockEffects, SuiTransactionBlockEffectsAPI,
     SuiTransactionBlockResponse, SuiTransactionBlockResponseOptions,
 };
-use sui_keys::keystore::AccountKeystore;
+use sui_keys::{encrypted_key, keystore::AccountKeystore};
 use sui_move_build::{
     build_from_resolution_graph, check_invalid_dependencies, check_unpublished_dependencies,
     gather_published_ids, implicit_deps, BuildConfig, CompiledPackage,
@@ -447,7 +447,7 @@ pub enum SuiClientCommands {
         /// The amount to transfer, if not specified, the entire coin object will be transferred.
         #[clap(long)]
         amount: Option<u64>,
-
+        
         #[clap(flatten)]
         opts: Opts,
     },
@@ -629,6 +629,9 @@ pub struct Opts {
     /// `sui client execute-combined-signed-tx --signed-tx-bytes <SIGNED_TX_BYTES>`.
     #[arg(long, required = false)]
     pub serialize_signed_transaction: bool,
+    /// Path to the encrypted key file to be used for signing
+    #[arg(long, required = false)]
+    pub key_file: Option<PathBuf>,
 }
 
 /// Global options with gas
@@ -651,6 +654,7 @@ impl Opts {
             dev_inspect: false,
             serialize_unsigned_transaction: false,
             serialize_signed_transaction: false,
+            key_file: None,
         }
     }
     /// Uses the passed gas_budget for the gas budget variable, sets dry run to true,
@@ -662,6 +666,7 @@ impl Opts {
             dev_inspect: false,
             serialize_unsigned_transaction: false,
             serialize_signed_transaction: false,
+            key_file: None,
         }
     }
 }
@@ -3029,11 +3034,24 @@ pub(crate) async fn dry_run_or_execute_or_serialize(
             tx_data,
         ))
     } else {
-        let signature = context.config.keystore.sign_secure(
-            &tx_data.sender(),
-            &tx_data,
-            Intent::sui_transaction(),
-        )?;
+        let signature: sui_types::crypto::Signature;
+        if let Some(key_file_path) = &opts.key_file {
+            // 키 파일 사용 시 비밀번호 요청
+            let password = rpassword::prompt_password("Enter password for key file: ")?;
+            
+            // 키 파일에서 키페어 로드
+            let key_data = encrypted_key::load_encrypted_key_data(&key_file_path)?;
+            
+            // 서명 생성
+            signature = encrypted_key::sign_encrypted(&key_data, &password, &tx_data, Intent::sui_transaction())?;
+        } else {
+            // 기존 키스토어 사용
+            signature = context.config.keystore.sign_secure(
+                &tx_data.sender(),
+                &tx_data,
+                Intent::sui_transaction(),
+            )?;
+        };
         let sender_signed_data = SenderSignedData::new_from_sender_signature(tx_data, signature);
         if serialize_signed_transaction {
             Ok(SuiClientCommandResult::SerializedSignedTransaction(
