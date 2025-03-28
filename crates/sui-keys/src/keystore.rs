@@ -408,7 +408,7 @@ impl FileBasedKeystore {
 
             let mut aliases_path = path.clone();
             aliases_path.set_extension("aliases");
-            fs::write(aliases_path, aliases_store)?;
+            fs::write(aliases_path, aliases_store)?
         }
         Ok(())
     }
@@ -626,27 +626,4 @@ mod tests {
         assert!(validate_alias("^A").is_err());
         assert!(validate_alias("-A").is_err());
     }
-}
-
-/// Verify password strength to ensure minimum security standards
-pub fn verify_password_strength(password: &str) -> Result<(), anyhow::Error> {
-    if password.len() < 8 {
-        return Err(anyhow!("Password must be at least 8 characters long"));
-    }
-    
-    let has_uppercase = password.chars().any(|c| c.is_uppercase());
-    let has_lowercase = password.chars().any(|c| c.is_lowercase());
-    let has_digit = password.chars().any(|c| c.is_digit(10));
-    let has_special = password.chars().any(|c| !c.is_alphanumeric());
-    
-    let strength_level = [has_uppercase, has_lowercase, has_digit, has_special]
-        .iter()
-        .filter(|&x| *x)
-        .count();
-    
-    if strength_level < 3 {
-        return Err(anyhow!("Password is too weak. It should contain at least 3 of the following: uppercase letters, lowercase letters, digits, special characters"));
-    }
-    
-    Ok(())
 }

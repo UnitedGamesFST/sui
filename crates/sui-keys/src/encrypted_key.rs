@@ -1,6 +1,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-
+use std::str::FromStr;
 use anyhow::{anyhow, Context};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::rngs::OsRng;
@@ -150,7 +150,7 @@ pub fn decrypt_key_pair(encrypted_data: &EncryptedKeyData, password: &str) -> Re
 /// Verify keypair address matches address in encrypted data
 pub fn verify_key_address(keypair: &SuiKeyPair, encrypted_data: &EncryptedKeyData) -> Result<SuiAddress, anyhow::Error> {
     let address_from_keypair: SuiAddress = (&keypair.public()).into();
-    let expected_address = parse_sui_address(&encrypted_data.address)?;
+    let expected_address: SuiAddress = SuiAddress::from_str(&encrypted_data.address)?;
     
     if address_from_keypair != expected_address {
         return Err(anyhow!(
@@ -160,20 +160,6 @@ pub fn verify_key_address(keypair: &SuiKeyPair, encrypted_data: &EncryptedKeyDat
     }
     
     Ok(address_from_keypair)
-}
-
-/// Helper function to parse SuiAddress from string
-pub fn parse_sui_address(s: &str) -> Result<SuiAddress, anyhow::Error> {
-    // Check if string starts with 0x
-    let s = if s.starts_with("0x") { &s[2..] } else { s };
-    
-    // Convert hex string to byte array
-    let bytes = hex::decode(s)
-        .map_err(|e| anyhow!("Invalid hex string for SuiAddress: {}", e))?;
-    
-    // Create SuiAddress
-    SuiAddress::try_from(bytes.as_slice())
-        .map_err(|e| anyhow!("Failed to convert bytes to SuiAddress: {}", e))
 }
 
 /// Sign transaction data with encrypted key data
@@ -302,26 +288,3 @@ pub fn load_key_from_keystore(
     // Return in expected order: keypair first, then address
     Ok((keypair, address))
 }
-
-/// Verify password strength to ensure minimum security standards
-pub fn verify_password_strength(password: &str) -> Result<(), anyhow::Error> {
-    if password.len() < 8 {
-        return Err(anyhow!("Password must be at least 8 characters long"));
-    }
-    
-    let has_uppercase = password.chars().any(|c| c.is_uppercase());
-    let has_lowercase = password.chars().any(|c| c.is_lowercase());
-    let has_digit = password.chars().any(|c| c.is_digit(10));
-    let has_special = password.chars().any(|c| !c.is_alphanumeric());
-    
-    let strength_level = [has_uppercase, has_lowercase, has_digit, has_special]
-        .iter()
-        .filter(|&x| *x)
-        .count();
-    
-    if strength_level < 3 {
-        return Err(anyhow!("Password is too weak. It should contain at least 3 of the following: uppercase letters, lowercase letters, digits, special characters"));
-    }
-    
-    Ok(())
-} 

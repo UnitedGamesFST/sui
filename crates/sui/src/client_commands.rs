@@ -447,7 +447,7 @@ pub enum SuiClientCommands {
         /// The amount to transfer, if not specified, the entire coin object will be transferred.
         #[clap(long)]
         amount: Option<u64>,
-        
+            
         #[clap(flatten)]
         opts: Opts,
     },

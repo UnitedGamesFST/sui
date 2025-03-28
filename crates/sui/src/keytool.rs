@@ -198,7 +198,6 @@ pub enum KeyToolCommand {
         #[clap(long, short = 's')]
         sort_by_alias: bool,
     },
-    
     /// This reads the content at the provided file path. The accepted format can be
     /// [enum SuiKeyPair] (Base64 encoded of 33-byte `flag || privkey`) or `type AuthorityKeyPair`
     /// (Base64 encoded `privkey`). This prints out the account keypair as Base64 encoded `flag || privkey`,
@@ -539,11 +538,8 @@ pub enum CommandOutput {
     DecodeOrVerifyTx(DecodeOrVerifyTxOutput),
     Error(String),
     Generate(Key),
-    GenerateEncrypted(Key),
     Import(Key),
-    ImportEncrypted(Key),
     Export(ExportedKey),
-    ExportEncrypted(ExportedKey),
     List(Vec<Key>),
     LoadKeypair(KeypairData),
     MultiSigAddress(MultiSigAddress),
