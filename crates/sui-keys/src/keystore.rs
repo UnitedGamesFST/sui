@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::key_derive::{derive_key_pair_from_path, generate_new_key};
-pub use crate::encrypted_key::{EncryptedKeyData, SignEncryptedData};
+pub use crate::encrypted_key::EncryptedKeyData;
 use crate::random_names::{random_name, random_names};
 use anyhow::{anyhow, bail, ensure, Context};
 use bip32::DerivationPath;
@@ -18,11 +18,13 @@ use std::fs;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use sui_types::base_types::SuiAddress;
 use sui_types::crypto::get_key_pair_from_rng;
 use sui_types::crypto::{
     enum_dispatch, EncodeDecodeBase64, PublicKey, Signature, SignatureScheme, SuiKeyPair,
 };
+use crate::encrypted_key::{sign_encrypted, create_encrypted_key};
 
 #[derive(Serialize, Deserialize)]
 #[enum_dispatch(AccountKeystore)]
@@ -33,8 +35,10 @@ pub enum Keystore {
 #[enum_dispatch]
 pub trait AccountKeystore: Send + Sync {
     fn add_key(&mut self, alias: Option<String>, keypair: SuiKeyPair) -> Result<(), anyhow::Error>;
+    fn add_encrypted_key(&mut self, alias: Option<String>, public_key: String, encrypted_key: EncryptedKeyData) -> Result<(), anyhow::Error>;
     fn keys(&self) -> Vec<PublicKey>;
     fn get_key(&self, address: &SuiAddress) -> Result<&SuiKeyPair, anyhow::Error>;
+    fn get_encrypted_key(&self, address: &SuiAddress) -> Result<&EncryptedKeyData, anyhow::Error>;
 
     fn sign_hashed(&self, address: &SuiAddress, msg: &[u8]) -> Result<Signature, signature::Error>;
 
@@ -47,7 +51,12 @@ pub trait AccountKeystore: Send + Sync {
     where
         T: Serialize;
     fn addresses(&self) -> Vec<SuiAddress> {
-        self.keys().iter().map(|k| k.into()).collect()
+        let mut addresses: Vec<SuiAddress> = self.keys().iter().map(|k| k.into()).collect();
+        
+        // 암호화된 키의 주소도 추가
+        addresses.extend(self.encrypted_addresses());
+        
+        addresses
     }
     fn addresses_with_alias(&self) -> Vec<(&SuiAddress, &Alias)>;
     fn aliases(&self) -> Vec<&Alias>;
@@ -102,10 +111,21 @@ pub trait AccountKeystore: Send + Sync {
         alias: Option<String>,
         derivation_path: Option<DerivationPath>,
         word_length: Option<String>,
+        is_encrypt: bool,
     ) -> Result<(SuiAddress, String, SignatureScheme), anyhow::Error> {
         let (address, kp, scheme, phrase) =
             generate_new_key(key_scheme, derivation_path, word_length)?;
-        self.add_key(alias, kp)?;
+
+        if is_encrypt {
+            let password = rpassword::prompt_password("Enter password for key file: ")
+                .map_err(|e| signature::Error::from_source(e.to_string()))?;
+
+            let encrypted_data = create_encrypted_key(&password, &kp)?;
+            self.add_encrypted_key(alias, kp.public().encode_base64(), encrypted_data)?;
+        } else {
+            self.add_key(alias, kp)?;
+        }
+       
         Ok((address, phrase, scheme))
     }
 
@@ -115,17 +135,30 @@ pub trait AccountKeystore: Send + Sync {
         key_scheme: SignatureScheme,
         derivation_path: Option<DerivationPath>,
         alias: Option<String>,
+        is_encrypt: bool,
     ) -> Result<SuiAddress, anyhow::Error> {
         let mnemonic = Mnemonic::from_phrase(phrase, Language::English)
             .map_err(|e| anyhow::anyhow!("Invalid mnemonic phrase: {:?}", e))?;
         let seed = Seed::new(&mnemonic, "");
         match derive_key_pair_from_path(seed.as_bytes(), derivation_path, &key_scheme) {
             Ok((address, kp)) => {
-                self.add_key(alias, kp)?;
+                if is_encrypt {
+                    let password = rpassword::prompt_password("Enter password for key file: ")
+                    .map_err(|e| signature::Error::from_source(e.to_string()))?;
+    
+                    let encrypted_data = create_encrypted_key(&password, &kp)?;
+                    self.add_encrypted_key(alias, kp.public().encode_base64(), encrypted_data)?;
+                } else {
+                    self.add_key(alias, kp)?;
+                }
                 Ok(address)
             }
             Err(e) => Err(anyhow!("error getting keypair {:?}", e)),
         }
+    }
+
+    fn encrypted_addresses(&self) -> Vec<SuiAddress> {
+        vec![] 
     }
 }
 
@@ -155,6 +188,7 @@ pub struct Alias {
 #[derive(Default)]
 pub struct FileBasedKeystore {
     keys: BTreeMap<SuiAddress, SuiKeyPair>,
+    encrypted_keys: BTreeMap<SuiAddress, EncryptedKeyData>,
     aliases: BTreeMap<SuiAddress, Alias>,
     path: Option<PathBuf>,
 }
@@ -203,12 +237,22 @@ impl AccountKeystore for FileBasedKeystore {
     where
         T: Serialize,
     {
-        Ok(Signature::new_secure(
-            &IntentMessage::new(intent, msg),
-            self.keys.get(address).ok_or_else(|| {
-                signature::Error::from_source(format!("Cannot find key for address: [{address}]"))
-            })?,
-        ))
+        if let Some(key) = self.keys.get(address) {
+            return Ok(Signature::new_secure(
+                &IntentMessage::new(intent, msg),
+                key,
+            ));
+        }
+        
+        if let Some(encrypted_key) = self.encrypted_keys.get(address) {
+            let password = rpassword::prompt_password("Enter password for key file: ")
+                .map_err(|e| signature::Error::from_source(e.to_string()))?;
+            
+            return sign_encrypted(encrypted_key, &password, msg, intent)
+                .map_err(|e| signature::Error::from_source(e.to_string()));
+        }
+        
+        Err(signature::Error::from_source(format!("Cannot find key for address: [{address}]")))
     }
 
     fn add_key(&mut self, alias: Option<String>, keypair: SuiKeyPair) -> Result<(), anyhow::Error> {
@@ -222,6 +266,22 @@ impl AccountKeystore for FileBasedKeystore {
             },
         );
         self.keys.insert(address, keypair);
+        self.save()?;
+        Ok(())
+    }
+
+    fn add_encrypted_key(&mut self, alias: Option<String>, public_key: String, encrypted_key: EncryptedKeyData) -> Result<(), anyhow::Error> {
+        let address: SuiAddress = SuiAddress::from_str(&encrypted_key.address)
+            .map_err(|e| anyhow!("Invalid address in encrypted key: {}", e))?;
+        let alias = self.create_alias(alias)?;
+        self.aliases.insert(
+            address,
+            Alias {
+                alias,
+                public_key_base64: public_key
+            },
+        );
+        self.encrypted_keys.insert(address, encrypted_key);
         self.save()?;
         Ok(())
     }
@@ -287,6 +347,15 @@ impl AccountKeystore for FileBasedKeystore {
         }
     }
 
+
+    fn get_encrypted_key(&self, address: &SuiAddress) -> Result<&EncryptedKeyData, anyhow::Error> {
+        match self.encrypted_keys.get(address) {
+            Some(key) => Ok(key),
+            None => Err(anyhow!("Cannot find key for address: [{address}]")),
+        }
+    }
+
+
     /// Updates an old alias to the new alias and saves it to the alias file.
     /// If the new_alias is None, it will generate a new random alias.
     fn update_alias(
@@ -298,29 +367,49 @@ impl AccountKeystore for FileBasedKeystore {
         self.save_aliases()?;
         Ok(new_alias_name)
     }
+
+    fn encrypted_addresses(&self) -> Vec<SuiAddress> {
+        self.encrypted_keys.keys().cloned().collect()
+    }
 }
 
 impl FileBasedKeystore {
     pub fn new(path: &PathBuf) -> Result<Self, anyhow::Error> {
-        let keys = if path.exists() {
-            let reader =
-                BufReader::new(File::open(path).with_context(|| {
-                    format!("Cannot open the keystore file: {}", path.display())
-                })?);
-            let kp_strings: Vec<String> = serde_json::from_reader(reader).with_context(|| {
-                format!("Cannot deserialize the keystore file: {}", path.display(),)
+        let mut keys = BTreeMap::new();
+        let mut encrypted_keys = BTreeMap::new();
+        
+        if path.exists() {
+            let reader = BufReader::new(File::open(path).with_context(|| {
+                format!("Cannot open the keystore file: {}", path.display())
+            })?);
+            
+            let json_values: serde_json::Value = serde_json::from_reader(reader).with_context(|| {
+                format!("Cannot parse the keystore file: {}", path.display())
             })?;
-            kp_strings
-                .iter()
-                .map(|kpstr| {
-                    let key = SuiKeyPair::decode_base64(kpstr);
-                    key.map(|k| (SuiAddress::from(&k.public()), k))
-                })
-                .collect::<Result<BTreeMap<_, _>, _>>()
-                .map_err(|e| anyhow!("Invalid keystore file: {}. {}", path.display(), e))?
-        } else {
-            BTreeMap::new()
-        };
+            
+            if let serde_json::Value::Array(items) = json_values {
+                for item in items {
+                    match item {
+                        serde_json::Value::String(kpstr) => {
+                            let key = SuiKeyPair::decode_base64(&kpstr)
+                                .map_err(|e| anyhow!("Invalid keypair string: {}", e))?;
+                            let address = SuiAddress::from(&key.public());
+                            keys.insert(address, key);
+                        },
+                        serde_json::Value::Object(_) => {
+                            let encrypted_key: EncryptedKeyData = serde_json::from_value(item)
+                                .map_err(|e| anyhow!("Invalid encrypted key format: {}", e))?;
+                            let address = SuiAddress::from_str(&encrypted_key.address)
+                                .map_err(|e| anyhow!("Invalid address in encrypted key: {}", e))?;
+                            encrypted_keys.insert(address, encrypted_key);
+                        },
+                        _ => return Err(anyhow!("Unexpected item in keystore file")),
+                    }
+                }
+            } else {
+                return Err(anyhow!("Keystore file is not an array"));
+            }
+        }
 
         // check aliases
         let mut aliases_path = path.clone();
@@ -386,6 +475,7 @@ impl FileBasedKeystore {
 
         Ok(Self {
             keys,
+            encrypted_keys,
             aliases,
             path: Some(path.to_path_buf()),
         })
@@ -418,14 +508,18 @@ impl FileBasedKeystore {
     /// $SUI_ADDRESS can be found with `sui keytool list`. Or use `sui keytool convert $BASE64_STR`
     pub fn save_keystore(&self) -> Result<(), anyhow::Error> {
         if let Some(path) = &self.path {
-            let store = serde_json::to_string_pretty(
-                &self
-                    .keys
-                    .values()
-                    .map(|k| k.encode_base64())
-                    .collect::<Vec<_>>(),
-            )
-            .with_context(|| format!("Cannot serialize keystore to file: {}", path.display()))?;
+            let mut all_items = Vec::new();
+            
+            for key in self.keys.values() {
+                all_items.push(serde_json::Value::String(key.encode_base64()));
+            }
+            
+            for encrypted_key in self.encrypted_keys.values() {
+                all_items.push(serde_json::to_value(encrypted_key)?);
+            }
+            
+            let store = serde_json::to_string_pretty(&all_items)
+                .with_context(|| format!("Cannot serialize keystore to file: {}", path.display()))?;
             fs::write(path, store)?;
         }
         Ok(())
@@ -446,6 +540,7 @@ impl FileBasedKeystore {
 pub struct InMemKeystore {
     aliases: BTreeMap<SuiAddress, Alias>,
     keys: BTreeMap<SuiAddress, SuiKeyPair>,
+    encrypted_keys: BTreeMap<SuiAddress, EncryptedKeyData>,
 }
 
 impl AccountKeystore for InMemKeystore {
@@ -466,12 +561,22 @@ impl AccountKeystore for InMemKeystore {
     where
         T: Serialize,
     {
-        Ok(Signature::new_secure(
-            &IntentMessage::new(intent, msg),
-            self.keys.get(address).ok_or_else(|| {
-                signature::Error::from_source(format!("Cannot find key for address: [{address}]"))
-            })?,
-        ))
+        if let Some(key) = self.keys.get(address) {
+            return Ok(Signature::new_secure(
+                &IntentMessage::new(intent, msg),
+                key,
+            ));
+        }
+        
+        if let Some(encrypted_key) = self.encrypted_keys.get(address) {
+            let password = rpassword::prompt_password("Enter password for key file: ")
+                .map_err(|e| signature::Error::from_source(e.to_string()))?;
+            
+            return sign_encrypted(encrypted_key, &password, msg, intent)
+                .map_err(|e| signature::Error::from_source(e.to_string()));
+        }
+        
+        Err(signature::Error::from_source(format!("Cannot find key for address: [{address}]")))
     }
 
     fn add_key(&mut self, alias: Option<String>, keypair: SuiKeyPair) -> Result<(), anyhow::Error> {
@@ -496,6 +601,29 @@ impl AccountKeystore for InMemKeystore {
         Ok(())
     }
 
+    fn add_encrypted_key(&mut self, alias: Option<String>, public_key: String, encrypted_key: EncryptedKeyData) -> Result<(), anyhow::Error> {
+        let address: SuiAddress = SuiAddress::from_str(&encrypted_key.address)
+            .map_err(|e| anyhow!("Invalid address in encrypted key: {}", e))?;
+        let alias = alias.unwrap_or_else(|| {
+            random_name(
+                &self
+                    .aliases()
+                    .iter()
+                    .map(|x| x.alias.clone())
+                    .collect::<HashSet<_>>(),
+            )
+        });
+
+        let public_key_base64: String = public_key;
+        let alias = Alias {
+            alias,
+            public_key_base64,
+        };
+        self.aliases.insert(address, alias);
+        self.encrypted_keys.insert(address, encrypted_key);
+        Ok(())
+    }
+
     /// Get all aliases objects
     fn aliases(&self) -> Vec<&Alias> {
         self.aliases.values().collect()
@@ -511,6 +639,13 @@ impl AccountKeystore for InMemKeystore {
 
     fn get_key(&self, address: &SuiAddress) -> Result<&SuiKeyPair, anyhow::Error> {
         match self.keys.get(address) {
+            Some(key) => Ok(key),
+            None => Err(anyhow!("Cannot find key for address: [{address}]")),
+        }
+    }
+
+    fn get_encrypted_key(&self, address: &SuiAddress) -> Result<&EncryptedKeyData, anyhow::Error> {
+        match self.encrypted_keys.get(address) {
             Some(key) => Ok(key),
             None => Err(anyhow!("Cannot find key for address: [{address}]")),
         }
@@ -565,6 +700,10 @@ impl AccountKeystore for InMemKeystore {
     ) -> Result<String, anyhow::Error> {
         self.update_alias_value(old_alias, new_alias)
     }
+
+    fn encrypted_addresses(&self) -> Vec<SuiAddress> {
+        self.encrypted_keys.keys().cloned().collect()
+    }
 }
 
 impl InMemKeystore {
@@ -574,6 +713,8 @@ impl InMemKeystore {
             .map(|_| get_key_pair_from_rng(&mut rng))
             .map(|(ad, k)| (ad, SuiKeyPair::Ed25519(k)))
             .collect::<BTreeMap<SuiAddress, SuiKeyPair>>();
+        
+        let encrypted_keys = BTreeMap::new();
 
         let aliases = keys
             .iter()
@@ -590,7 +731,7 @@ impl InMemKeystore {
             })
             .collect::<BTreeMap<_, _>>();
 
-        Self { aliases, keys }
+        Self { aliases, keys, encrypted_keys }
     }
 }
 

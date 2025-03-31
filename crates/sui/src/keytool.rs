@@ -43,7 +43,7 @@ use sui_keys::keypair_file::{
     write_keypair_to_file,
 };
 use sui_keys::keystore::{AccountKeystore, Keystore};
-use sui_keys::encrypted_key;
+use sui_keys::encrypted_key::{create_encrypted_key, decrypt_key_pair};
 use sui_types::base_types::SuiAddress;
 use sui_types::committee::EpochId;
 use sui_types::crypto::{
@@ -62,7 +62,6 @@ use tabled::builder::Builder;
 use tabled::settings::Rotate;
 use tabled::settings::{object::Rows, Modify, Width};
 use tracing::info;
-use std::str::FromStr;
 
 #[cfg(test)]
 #[path = "unit_tests/keytool_tests.rs"]
@@ -127,10 +126,6 @@ pub enum KeyToolCommand {
     /// Creates a standalone .encrypted file containing the key without creating a full keystore.
     /// The file will be named with the address of the generated key and stored in the specified output directory.
     GenerateEncrypted {
-        /// Output directory for the encrypted key file
-        #[clap(long, default_value = ".")]
-        output_dir: PathBuf,
-        
         /// Password for encrypting the key
         #[clap(long)]
         password: Option<String>,
@@ -158,10 +153,6 @@ pub enum KeyToolCommand {
     /// Import a key (Bech32 encoded private key) into the encrypted keystore.
     /// Supports Bech32 encoded private keys starting with "suiprivkey". 
     ImportEncrypted {
-        /// Path to the encrypted keystore
-        #[clap(long, default_value = ".")]
-        path: PathBuf,
-        
         /// Password for the encrypted keystore
         #[clap(long)]
         password: Option<String>,
@@ -182,9 +173,9 @@ pub enum KeyToolCommand {
     /// starting with "suiprivkey". Requires the key identity (address or alias) and
     /// the password for the encrypted keystore.
     ExportEncrypted {
-        /// Path to the encrypted keystore
+        /// Sui address of the key
         #[clap(long)]
-        path: PathBuf,
+        key_identity: KeyIdentity,
         
         /// Password for the encrypted keystore
         #[clap(long)]
@@ -274,27 +265,6 @@ pub enum KeyToolCommand {
         intent: Option<Intent>,
         #[clap(long)]
         base64pk: String,
-    },
-    
-    /// Securely sign a transaction using an encrypted key file (.encrypted).
-    /// The key file should be named with the address of the key and have the .encrypted extension.
-    /// Provides the signature and signed transaction data for use with sui client commands.
-    SignEncrypted {
-        /// Path to the key file (.encrypted)
-        #[clap(long)]
-        key_file: PathBuf,
-
-        /// Transaction data to sign (Base64 encoded BCS serialized TransactionData)
-        #[clap(long)]
-        data: String,
-
-        /// Password (if not provided, will be prompted)
-        #[clap(long)]
-        password: Option<String>,
-
-        /// Transaction intent (default: TransactionData)
-        #[clap(long)]
-        intent: Option<Intent>,
     },
     
     /// This takes [enum SuiKeyPair] of Base64 encoded of 33-byte `flag || privkey`). It
@@ -549,7 +519,6 @@ pub enum CommandOutput {
     Show(Key),
     Sign(SignData),
     SignKMS(SerializedSig),
-    SignEncrypted(SignData),
     ZkLoginSignAndExecuteTx(ZkLoginSignAndExecuteTx),
     ZkLoginInsecureSignPersonalMessage(ZkLoginInsecureSignPersonalMessage),
     ZkLoginSigVerify(ZkLoginSigVerifyResponse),
@@ -694,7 +663,6 @@ impl KeyToolCommand {
                 }
             }
             KeyToolCommand::GenerateEncrypted {
-                output_dir,
                 password,
                 key_scheme,
             } => {
@@ -721,31 +689,13 @@ impl KeyToolCommand {
                 println!("Generated address: {}", sui_address);
                 println!("Key type: {}", scheme);
                 
-                // Extract required information
-                let public_key_base64 = keypair.public().encode_base64();
-                let flag = keypair.public().flag();
-                let peer_id = anemo_styling(&keypair.public());
-                
                 // Create encrypted key file
-                let (encrypted_file_path, _) = encrypted_key::create_encrypted_key_file(
-                    &output_dir, 
-                    &password, 
-                    &keypair
-                )?;
+                create_encrypted_key(&password, &keypair)?;
                 
-                // Return generated key info
-                let key = Key {
-                    alias: None,
-                    sui_address,
-                    public_base64_key: public_key_base64,
-                    key_scheme: scheme.to_string(),
-                    flag,
-                    mnemonic: None,
-                    peer_id,
-                };
+                let key = Key::from(&keypair);
                 
                 // Display file information
-                println!("Encrypted key file created: {}", encrypted_file_path.display());
+                println!("Encrypted key file created");
                 
                 CommandOutput::Generate(key)
             }
@@ -785,6 +735,7 @@ impl KeyToolCommand {
                             key_scheme,
                             derivation_path,
                             alias.clone(),
+                            false,
                         )?;
                         let skp = keystore.get_key(&sui_address)?;
                         let mut key = Key::from(skp);
@@ -800,7 +751,6 @@ impl KeyToolCommand {
                 }
             }
             KeyToolCommand::ImportEncrypted {
-                path,
                 password,
                 private_key,
             } => {
@@ -835,8 +785,8 @@ impl KeyToolCommand {
                         info!("Importing Bech32 encoded private key to keystore");
                         let key = Key::from(&skp);
 
-                        let (encrypted_file_path, _) = encrypted_key::create_encrypted_key_file(&path, &password, &skp)?;
-                        println!("Encrypted key file created: {}", encrypted_file_path.display());
+                        create_encrypted_key(&password, &skp)?;
+                        println!("Encrypted key file created");
 
                         CommandOutput::Import(key)
                     }
@@ -859,7 +809,7 @@ impl KeyToolCommand {
                 CommandOutput::Export(key)
             }
             KeyToolCommand::ExportEncrypted {
-                path,
+                key_identity,
                 password,
             } => {                
                 // Handle password
@@ -871,11 +821,11 @@ impl KeyToolCommand {
                         rpassword::read_password()?
                     }
                 };
+
+                let address = get_identity_address_from_keystore(key_identity, keystore)?;
+                let encrypted_key = keystore.get_encrypted_key(&address)?;
                 
-                // Load keystore
-                let encrypted_keystore = encrypted_key::load_encrypted_key_data(&path)?;
-                
-                let skp: SuiKeyPair = encrypted_key::decrypt_key_pair(&encrypted_keystore, &password)?;
+                let skp: SuiKeyPair = decrypt_key_pair(&encrypted_key, &password)?;
                 let key = ExportedKey {
                     exported_private_key: skp
                         .encode()
@@ -1114,53 +1064,6 @@ impl KeyToolCommand {
                 let serialized_sig = Base64::encode(&serialized_sig);
                 CommandOutput::SignKMS(SerializedSig {
                     serialized_sig_base64: serialized_sig,
-                })
-            }
-            KeyToolCommand::SignEncrypted {
-                key_file,
-                data,
-                password,
-                intent,
-            } => {                
-                // Handle password
-                let password = match password {
-                    Some(pwd) => pwd,
-                    None => {
-                        print!("Enter password: ");
-                        io::stdout().flush()?;
-                        rpassword::read_password()?
-                    }
-                };
-
-                // Try to load keypair
-                let encrypted_data = encrypted_key::load_encrypted_key_data(&key_file)?;
-
-                let extracted_address = SuiAddress::from_str(&encrypted_data.address)?;
-
-                let intent = intent.unwrap_or_else(Intent::sui_transaction);
-                let intent_clone = intent.clone();
-                let msg: TransactionData =
-                    bcs::from_bytes(&Base64::decode(&data).map_err(|e| {
-                        anyhow!("Cannot deserialize data as TransactionData {:?}", e)
-                    })?)?;
-                let intent_msg = IntentMessage::new(intent, msg);
-                let raw_intent_msg: String = Base64::encode(bcs::to_bytes(&intent_msg)?);
-                let mut hasher = DefaultHash::default();
-                hasher.update(bcs::to_bytes(&intent_msg)?);
-                let digest = hasher.finalize().digest;
-                let signature = encrypted_key::sign_encrypted(
-                    &encrypted_data,
-                    &password,
-                    &intent_msg.value,
-                    intent_msg.intent,
-                )?;
-                CommandOutput::Sign(SignData {
-                    sui_address: extracted_address,
-                    raw_tx_data: data,
-                    intent: intent_clone,
-                    raw_intent_msg,
-                    digest: Base64::encode(digest),
-                    sui_signature: signature.encode_base64(),
                 })
             }
             KeyToolCommand::Unpack { keypair } => {
@@ -1617,13 +1520,6 @@ impl Display for CommandOutput {
             CommandOutput::Success(message) => {
                 write!(formatter, "{}", message)
             }
-            CommandOutput::SignEncrypted(s) => {
-                writeln!(
-                    formatter,
-                    "{{\n  \"digest\": \"{}\",\n  \"signature\": \"{}\"\n}}",
-                    s.digest, s.sui_signature
-                )
-            }
             _ => {
                 let json_obj = json![self];
                 let mut table = json_to_table(&json_obj);
@@ -1653,9 +1549,6 @@ impl CommandOutput {
             }
             CommandOutput::ZkLoginSigVerify(_) => {
                 println!("{}", self);
-            }
-            CommandOutput::SignEncrypted(s) => {
-                println!("{{\n  \"digest\": \"{}\",\n  \"signature\": \"{}\"\n}}", s.digest, s.sui_signature);
             }
             _ => {
                 let line = if pretty {
@@ -1710,13 +1603,6 @@ impl Debug for CommandOutput {
             }
             CommandOutput::Success(message) => {
                 writeln!(f, "{}", message)
-            }
-            CommandOutput::SignEncrypted(s) => {
-                writeln!(
-                    f,
-                    "{{\n  \"digest\": \"{}\",\n  \"signature\": \"{}\"\n}}",
-                    s.digest, s.sui_signature
-                )
             }
             _ => {
                 let json_obj = json![self];

@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use std::str::FromStr;
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -9,12 +9,9 @@ use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, NONCE_LEN};
 use ring::pbkdf2;
 use serde::{Deserialize, Serialize};
 use shared_crypto::intent::{Intent, IntentMessage};
-use std::fs;
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
 use sui_types::base_types::SuiAddress;
 use sui_types::crypto::{EncodeDecodeBase64, Signature, SuiKeyPair};
-use sui_types::transaction::SenderSignedData;
 
 // Encryption-related constants
 const PBKDF2_ITERATIONS: u32 = 100_000;
@@ -38,52 +35,6 @@ pub struct EncryptedKeyData {
     pub address: String,
     /// The ciphertext (Base64 encoded)
     pub ciphertext: String,
-}
-
-/// Data structure for secure signing results using encrypted key
-#[derive(Serialize, Deserialize, Debug)]
-pub struct SignEncryptedData {
-    /// SUI address of the signer
-    pub sui_address: SuiAddress,
-    
-    /// Base64 encoded transaction data serialization string
-    pub raw_tx_data: String,
-    
-    /// Intent structure used
-    pub intent: Intent,
-    
-    /// Base64 encoded serialized IntentMessage in the form of (intent || message)
-    pub raw_intent_msg: String,
-    
-    /// Blake2b hash of the signed intent message (Base64 encoded)
-    pub digest: String,
-    
-    /// Base64 encoded string of complete Sui signature (flag || signature || pubkey)
-    pub sui_signature: String,
-    
-    /// Signed transaction
-    pub signed_data: SenderSignedData,
-}
-
-/// Load EncryptedKeyData from file
-/// Reads and parses an encrypted key file in the standard format (.encrypted).
-/// Only supports version 1 of the encryption format.
-/// Future versions may add support for different encryption algorithms.
-pub fn load_encrypted_key_data(key_file: &Path) -> Result<EncryptedKeyData, anyhow::Error> {
-    // Read encrypted data from file
-    let json = fs::read_to_string(key_file)
-        .map_err(|e| anyhow!("Failed to read key file: {}", e))?;
-    
-    // Parse into encrypted data structure
-    let encrypted_data: EncryptedKeyData = serde_json::from_str(&json)
-        .map_err(|e| anyhow!("Invalid key file format: {}", e))?;
-    
-    // Verify encryption version
-    if encrypted_data.version != 1 {
-        return Err(anyhow!("Unsupported encryption version: {}", encrypted_data.version));
-    }
-    
-    Ok(encrypted_data)
 }
 
 /// Decrypt keypair from EncryptedKeyData
@@ -196,19 +147,10 @@ where
 /// Create a new encrypted key file
 /// Encrypts the provided keypair with the given password using AES-256-GCM
 /// and writes it to a file named with the SUI address.
-pub fn create_encrypted_key_file(
-    output_dir: &Path,
+pub fn create_encrypted_key(
     password: &str,
     keypair: &SuiKeyPair
-) -> Result<(PathBuf, SuiAddress), anyhow::Error> {
-    let sui_address: SuiAddress = (&keypair.public()).into();
-    
-    // Check output directory and create if needed
-    if !output_dir.exists() {
-        fs::create_dir_all(output_dir)
-            .with_context(|| format!("Failed to create output directory: {:?}", output_dir))?;
-    }
-    
+) -> Result<EncryptedKeyData, anyhow::Error> {    
     // Generate encryption parameters
     let mut salt = [0u8; SALT_SIZE];
     let mut rng = OsRng;
@@ -217,24 +159,19 @@ pub fn create_encrypted_key_file(
     let mut iv = [0u8; NONCE_LEN];
     rng.fill_bytes(&mut iv);
     
-    // Create encrypted key file path
-    let encrypted_file_name = format!("{}.encrypted", sui_address);
-    let encrypted_file_path = output_dir.join(&encrypted_file_name);
-    
     // Encrypt and save
-    encrypt_keypair_to_file(keypair, password, &encrypted_file_path, &salt, &iv)?;
+    let encrypted_data = create_encrypt_key_data(keypair, password, &salt, &iv)?;
     
-    Ok((encrypted_file_path, sui_address))
+    Ok(encrypted_data)
 }
 
 /// Internal function to encrypt and save keypair to file
-fn encrypt_keypair_to_file(
+fn create_encrypt_key_data(
     keypair: &SuiKeyPair,
     password: &str,
-    file_path: &PathBuf,
     salt: &[u8],
     iv: &[u8; NONCE_LEN]
-) -> Result<(), anyhow::Error> {
+) -> Result<EncryptedKeyData, anyhow::Error> {
     // Derive encryption key from password
     let iterations = NonZeroU32::new(PBKDF2_ITERATIONS).unwrap();
     
@@ -277,27 +214,5 @@ fn encrypt_keypair_to_file(
         ciphertext: BASE64.encode(&serialized_data),
     };
     
-    // Serialize to JSON and save to file
-    let json = serde_json::to_string_pretty(&encrypted_data)?;
-    fs::write(file_path, json)?;
-    
-    Ok(())
-}
-
-/// Load keypair from keystore using password
-pub fn load_key_from_keystore(
-    key_file: &Path,
-    password: &str
-) -> Result<(SuiKeyPair, SuiAddress), anyhow::Error> {
-    // Load encrypted data
-    let encrypted_data = load_encrypted_key_data(key_file)?;
-    
-    // Decrypt keypair
-    let keypair = decrypt_key_pair(&encrypted_data, password)?;
-    
-    // Verify address
-    let address = verify_key_address(&keypair, &encrypted_data)?;
-    
-    // Return in expected order: keypair first, then address
-    Ok((keypair, address))
+    Ok(encrypted_data)
 }

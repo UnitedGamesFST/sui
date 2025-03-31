@@ -299,12 +299,12 @@ pub fn retrieve_wallet() -> Result<WalletContext, anyhow::Error> {
         *address
     } else {
         keystore
-            .generate_and_add_new_key(ED25519, None, None, None)?
+            .generate_and_add_new_key(ED25519, None, None, None, false)?
             .0
     };
 
     if keystore.addresses().len() < 2 {
-        keystore.generate_and_add_new_key(ED25519, None, None, None)?;
+        keystore.generate_and_add_new_key(ED25519, None, None, None, false)?;
     }
 
     client_config.active_address = Some(default_active_address);

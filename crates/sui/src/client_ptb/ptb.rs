@@ -149,7 +149,6 @@ impl PTB {
         let opts = OptsWithGas {
             gas: program_metadata.gas_object_id.map(|x| x.value),
             rest: Opts {
-                key_file: None,
                 dry_run: program_metadata.dry_run_set,
                 dev_inspect: program_metadata.dev_inspect_set,
                 gas_budget: program_metadata.gas_budget.map(|x| x.value),

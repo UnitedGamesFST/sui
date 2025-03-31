@@ -1319,7 +1319,7 @@ async fn prompt_if_no_config(
                 }
             };
             let (new_address, phrase, scheme) =
-                keystore.generate_and_add_new_key(key_scheme, None, None, None)?;
+                keystore.generate_and_add_new_key(key_scheme, None, None, None, false)?;
             let alias = keystore.get_alias_by_address(&new_address)?;
             println!(
                 "Generated new keypair and alias for address with scheme {:?} [{alias}: {new_address}]",

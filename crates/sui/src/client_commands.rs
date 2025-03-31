@@ -49,7 +49,7 @@ use sui_json_rpc_types::{
     SuiProtocolConfigValue, SuiRawData, SuiTransactionBlockEffects, SuiTransactionBlockEffectsAPI,
     SuiTransactionBlockResponse, SuiTransactionBlockResponseOptions,
 };
-use sui_keys::{encrypted_key, keystore::AccountKeystore};
+use sui_keys::keystore::AccountKeystore;
 use sui_move_build::{
     build_from_resolution_graph, check_invalid_dependencies, check_unpublished_dependencies,
     gather_published_ids, implicit_deps, BuildConfig, CompiledPackage,
@@ -255,6 +255,9 @@ pub enum SuiClientCommands {
         alias: Option<String>,
         word_length: Option<String>,
         derivation_path: Option<DerivationPath>,
+        /// Create an encrypted key
+        #[clap(long)]
+        is_encrypt: bool,
     },
 
     /// Add new Sui environment.
@@ -629,11 +632,6 @@ pub struct Opts {
     /// `sui client execute-combined-signed-tx --signed-tx-bytes <SIGNED_TX_BYTES>`.
     #[arg(long, required = false)]
     pub serialize_signed_transaction: bool,
-    /// Path to the encrypted key file to be used for signing
-    /// This allows using a password-protected key file instead of the keystore
-    /// for enhanced security. When specified, you will be prompted for the password.
-    #[arg(long, required = false)]
-    pub key_file: Option<PathBuf>,
 }
 
 /// Global options with gas
@@ -655,8 +653,7 @@ impl Opts {
             dry_run: false,
             dev_inspect: false,
             serialize_unsigned_transaction: false,
-            serialize_signed_transaction: false,
-            key_file: None,
+            serialize_signed_transaction: false
         }
     }
     /// Uses the passed gas_budget for the gas budget variable, sets dry run to true,
@@ -667,8 +664,7 @@ impl Opts {
             dry_run: true,
             dev_inspect: false,
             serialize_unsigned_transaction: false,
-            serialize_signed_transaction: false,
-            key_file: None,
+            serialize_signed_transaction: false
         }
     }
 }
@@ -1482,12 +1478,14 @@ impl SuiClientCommands {
                 alias,
                 derivation_path,
                 word_length,
+                is_encrypt,
             } => {
                 let (address, phrase, scheme) = context.config.keystore.generate_and_add_new_key(
                     key_scheme,
                     alias.clone(),
                     derivation_path,
                     word_length,
+                    is_encrypt
                 )?;
 
                 let alias = match alias {
@@ -3036,24 +3034,12 @@ pub(crate) async fn dry_run_or_execute_or_serialize(
             tx_data,
         ))
     } else {
-        let signature: sui_types::crypto::Signature;
-        if let Some(key_file_path) = &opts.key_file {
-            // Request password when using key file
-            let password = rpassword::prompt_password("Enter password for key file: ")?;
-            
-            // Load key data from encrypted key file
-            let key_data = encrypted_key::load_encrypted_key_data(&key_file_path)?;
-            
-            // Generate signature with encrypted key
-            signature = encrypted_key::sign_encrypted(&key_data, &password, &tx_data, Intent::sui_transaction())?;
-        } else {
-            // Use the existing keystore
-            signature = context.config.keystore.sign_secure(
-                &tx_data.sender(),
-                &tx_data,
-                Intent::sui_transaction(),
-            )?;
-        };
+        let signature = context.config.keystore.sign_secure(
+            &tx_data.sender(),
+            &tx_data,
+            Intent::sui_transaction(),
+        )?;
+
         let sender_signed_data = SenderSignedData::new_from_sender_signature(tx_data, signature);
         if serialize_signed_transaction {
             Ok(SuiClientCommandResult::SerializedSignedTransaction(
