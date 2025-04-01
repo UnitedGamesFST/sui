@@ -43,7 +43,7 @@ use sui_keys::keypair_file::{
     write_keypair_to_file,
 };
 use sui_keys::keystore::{AccountKeystore, Keystore};
-use sui_keys::encrypted_key::{create_encrypted_key, decrypt_key_pair};
+use sui_keys::encrypted_keystore::{AccountEncryptedKeystore, EncryptedKeystore, create_encrypted_key, decrypt_key_pair};
 use sui_types::base_types::SuiAddress;
 use sui_types::committee::EpochId;
 use sui_types::crypto::{
@@ -526,13 +526,13 @@ pub enum CommandOutput {
 }
 
 impl KeyToolCommand {
-    pub async fn execute(self, keystore: &mut Keystore) -> Result<CommandOutput, anyhow::Error> {
+    pub async fn execute(self, keystore: &mut Keystore, encrypted_keystore: &mut EncryptedKeystore) -> Result<CommandOutput, anyhow::Error> {
         let cmd_result = Ok(match self {
             KeyToolCommand::Alias {
                 old_alias,
                 new_alias,
             } => {
-                let new_alias = keystore.update_alias(&old_alias, new_alias.as_deref())?;
+                let new_alias: String = keystore.update_alias(&old_alias, new_alias.as_deref())?;
                 CommandOutput::Alias(AliasUpdate {
                     old_alias,
                     new_alias,
@@ -735,7 +735,6 @@ impl KeyToolCommand {
                             key_scheme,
                             derivation_path,
                             alias.clone(),
-                            false,
                         )?;
                         let skp = keystore.get_key(&sui_address)?;
                         let mut key = Key::from(skp);
@@ -798,7 +797,7 @@ impl KeyToolCommand {
                 }
             }
             KeyToolCommand::Export { key_identity } => {
-                let address = get_identity_address_from_keystore(key_identity, keystore)?;
+                let address = get_identity_address_from_keystore(key_identity, keystore, Some(encrypted_keystore))?;
                 let skp = keystore.get_key(&address)?;
                 let key = ExportedKey {
                     exported_private_key: skp
@@ -822,8 +821,8 @@ impl KeyToolCommand {
                     }
                 };
 
-                let address = get_identity_address_from_keystore(key_identity, keystore)?;
-                let encrypted_key = keystore.get_encrypted_key(&address)?;
+                let address = get_identity_address_from_keystore(key_identity, keystore, Some(encrypted_keystore))?;
+                let encrypted_key = encrypted_keystore.get_key(&address)?;
                 
                 let skp: SuiKeyPair = decrypt_key_pair(&encrypted_key, &password)?;
                 let key = ExportedKey {
@@ -844,6 +843,14 @@ impl KeyToolCommand {
                         key
                     })
                     .collect::<Vec<Key>>();
+
+                for enc_pk in encrypted_keystore.keys() {
+                    let mut encrypted_key_info = Key::from(enc_pk);
+                    let address = encrypted_key_info.sui_address;
+                    encrypted_key_info.alias = encrypted_keystore.get_alias_by_address(&address).ok();
+                    keys.push(encrypted_key_info);
+                }
+
                 if sort_by_alias {
                     keys.sort_unstable();
                 }
@@ -984,7 +991,7 @@ impl KeyToolCommand {
                 data,
                 intent,
             } => {
-                let address = get_identity_address_from_keystore(address, keystore)?;
+                let address = get_identity_address_from_keystore(address, keystore, Some(encrypted_keystore))?;
                 let intent = intent.unwrap_or_else(Intent::sui_transaction);
                 let intent_clone = intent.clone();
                 let msg: TransactionData =

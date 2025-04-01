@@ -2589,6 +2589,7 @@ async fn test_switch_command() -> Result<(), anyhow::Error> {
         alias: None,
         derivation_path: None,
         word_length: None,
+        is_encrypt: false,
     }
     .execute(context)
     .await?;
@@ -2642,6 +2643,7 @@ async fn test_new_address_command_by_flag() -> Result<(), anyhow::Error> {
         alias: None,
         derivation_path: None,
         word_length: None,
+        is_encrypt: false,
     }
     .execute(context)
     .await?;

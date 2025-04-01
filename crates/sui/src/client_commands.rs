@@ -50,6 +50,7 @@ use sui_json_rpc_types::{
     SuiTransactionBlockResponse, SuiTransactionBlockResponseOptions,
 };
 use sui_keys::keystore::AccountKeystore;
+use sui_keys::encrypted_keystore::AccountEncryptedKeystore;
 use sui_move_build::{
     build_from_resolution_graph, check_invalid_dependencies, check_unpublished_dependencies,
     gather_published_ids, implicit_deps, BuildConfig, CompiledPackage,
@@ -1480,17 +1481,29 @@ impl SuiClientCommands {
                 word_length,
                 is_encrypt,
             } => {
-                let (address, phrase, scheme) = context.config.keystore.generate_and_add_new_key(
-                    key_scheme,
-                    alias.clone(),
-                    derivation_path,
-                    word_length,
-                    is_encrypt
-                )?;
+                let (address, phrase, scheme) = if is_encrypt {
+                    context.config.encrypted_keystore.as_mut().ok_or_else(|| anyhow!("Encrypted keystore is not available"))?.generate_and_add_new_key(
+                        key_scheme,
+                        alias.clone(),
+                        derivation_path,
+                        word_length,
+                    )?
+                } else {
+                    context.config.keystore.generate_and_add_new_key(
+                        key_scheme,
+                        alias.clone(),
+                        derivation_path,
+                        word_length,
+                    )?
+                };
 
                 let alias = match alias {
                     Some(x) => x,
-                    None => context.config.keystore.get_alias_by_address(&address)?,
+                    None => if is_encrypt {
+                        context.config.encrypted_keystore.as_ref().ok_or_else(|| anyhow!("Encrypted keystore is not available"))?.get_alias_by_address(&address)?
+                    } else {
+                        context.config.keystore.get_alias_by_address(&address)?
+                    },
                 };
 
                 SuiClientCommandResult::NewAddress(NewAddressOutput {
@@ -1599,7 +1612,7 @@ impl SuiClientCommands {
 
                 if let Some(address) = address {
                     let address = get_identity_address(Some(address), context)?;
-                    if !context.config.keystore.addresses().contains(&address) {
+                    if !context.config.keystore.addresses().contains(&address) && !context.config.encrypted_keystore.as_ref().map_or(false, |ks| ks.addresses().contains(&address)) {
                         return Err(anyhow!("Address {} not managed by wallet", address));
                     }
                     context.config.active_address = Some(address);
