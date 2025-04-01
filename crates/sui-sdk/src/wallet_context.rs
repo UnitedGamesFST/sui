@@ -313,7 +313,7 @@ impl WalletContext {
         // Try to sign with keystore first
         let sig = match self.config.keystore.sign_secure(&data.sender(), data, Intent::sui_transaction()) {
             Ok(sig) => sig,
-            Err(e) => {
+            Err(_) => {
                 // If not found in keystore, try encrypted_keystore
                 if let Some(encrypted_ks) = &self.config.encrypted_keystore {
                     match encrypted_ks.sign_secure(&data.sender(), data, Intent::sui_transaction()) {

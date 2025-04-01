@@ -713,12 +713,12 @@ impl EncryptedFileBasedKeystore {
             let (address, kp) = get_key_pair_from_rng(&mut rng);
             let sui_key_pair = SuiKeyPair::Ed25519(kp);
             
-            // 테스트용 고정 비밀번호 사용
+            // Use fixed password for testing
             let test_password = "test_password";
             let encrypted_data = create_encrypted_key(test_password, &sui_key_pair)
                 .expect("Failed to create encrypted key");
             
-            // 랜덤 이름 생성
+            // Generate random name
             let alias = random_name(&HashSet::new());
             
             aliases.insert(
