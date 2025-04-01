@@ -16,7 +16,7 @@ use std::fmt::Write as FmtWrite;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::fs::File;
-use std::io::{self, Write, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use sui_types::base_types::SuiAddress;
@@ -320,13 +320,12 @@ pub trait AccountEncryptedKeystore: Send + Sync {
         let (address, kp, scheme, phrase) =
             generate_new_key(key_scheme, derivation_path, word_length)?;
 
-        print!("Enter password: ");
-        io::stdout().flush()?;
-        let password = rpassword::read_password()?;
-        print!("Confirm password: ");
-        io::stdout().flush()?;
-        let confirm_pwd = rpassword::read_password()?;
-        if password != confirm_pwd {
+        let password = prompt_password("Enter password: ")
+            .map_err(|e| anyhow!(e.to_string()))?;
+        let _confirm_pwd = prompt_password("Confirm password: ")
+            .map_err(|e| anyhow!(e.to_string()))?;
+        
+        if password != _confirm_pwd {
             return Err(anyhow!("Passwords do not match"));
         }
 
@@ -348,9 +347,15 @@ pub trait AccountEncryptedKeystore: Send + Sync {
         let seed = Seed::new(&mnemonic, "");
         match derive_key_pair_from_path(seed.as_bytes(), derivation_path, &key_scheme) {
             Ok((address, kp)) => {
-                let password = rpassword::prompt_password("Enter password for key file: ")
-                    .map_err(|e| signature::Error::from_source(e.to_string()))?;
-    
+                let password = prompt_password("Enter password: ")
+                .map_err(|e| anyhow!(e.to_string()))?;
+                let _confirm_pwd = prompt_password("Confirm password: ")
+                    .map_err(|e| anyhow!(e.to_string()))?;
+                
+                if password != _confirm_pwd {
+                    return Err(anyhow!("Passwords do not match"));
+                }
+
                 let encrypted_data = create_encrypted_key(&password, &kp)?;
                 self.add_key(alias,  encrypted_data)?;
                 Ok(address)
@@ -416,11 +421,17 @@ impl<'de> Deserialize<'de> for EncryptedFileBasedKeystore {
     }
 }
 
+/// Helper function to prompt for password and securely handle it
+/// Centralizes password input logic to avoid code duplication
+fn prompt_password(prompt: &str) -> Result<String, signature::Error> {
+    rpassword::prompt_password(prompt)
+        .map_err(|e| signature::Error::from_source(e.to_string()))
+}
+
 impl AccountEncryptedKeystore for EncryptedFileBasedKeystore {
     fn sign_hashed(&self, address: &SuiAddress, msg: &[u8]) -> Result<Signature, signature::Error> {
         if let Some(encrypted_key) = self.keys.get(address) {
-            let password = rpassword::prompt_password("Enter password for key file: ")
-                .map_err(|e| signature::Error::from_source(e.to_string()))?;
+            let password = prompt_password("Enter password for key file: ")?;
             
             let keypair = decrypt_key_pair(encrypted_key, &password)
                 .map_err(|e| signature::Error::from_source(e.to_string()))?;
@@ -441,8 +452,7 @@ impl AccountEncryptedKeystore for EncryptedFileBasedKeystore {
         T: Serialize,
     {
         if let Some(encrypted_key) = self.keys.get(address) {
-            let password = rpassword::prompt_password("Enter password for key file: ")
-                .map_err(|e| signature::Error::from_source(e.to_string()))?;
+            let password = prompt_password("Enter password for key file: ")?;
             
             return sign_encrypted(encrypted_key, &password, msg, intent)
                 .map_err(|e| signature::Error::from_source(e.to_string()));
