@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_graphql::dataloader::DataLoader;
 use prometheus::Registry;
@@ -59,13 +60,22 @@ impl Context {
         metrics: Arc<RpcMetrics>,
         registry: &Registry,
         cancel: CancellationToken,
+        slow_request_threshold: Duration,
     ) -> Result<Self, Error> {
-        let pg_reader =
-            PgReader::new(database_url, db_args, metrics.clone(), registry, cancel).await?;
+        let pg_reader = PgReader::new(
+            database_url,
+            db_args,
+            metrics.clone(),
+            registry,
+            cancel,
+            slow_request_threshold,
+        )
+        .await?;
         let pg_loader = Arc::new(pg_reader.as_data_loader());
 
         let kv_loader = if let Some(config) = config.bigtable.clone() {
-            let bigtable_reader = BigtableReader::new(config.instance_id, registry).await?;
+            let bigtable_reader =
+                BigtableReader::new(config.instance_id, registry, slow_request_threshold).await?;
             KvLoader::new_with_bigtable(Arc::new(bigtable_reader.as_data_loader()))
         } else {
             KvLoader::new_with_pg(pg_loader.clone())

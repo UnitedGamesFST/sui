@@ -2021,6 +2021,16 @@ pub(crate) async fn compile_package(
         eprintln!("{}", "Skipping dependency verification".bold().yellow());
     }
 
+    if compiled_package
+        .get_package_bytes(with_unpublished_dependencies)
+        .is_empty()
+    {
+        return Err(SuiError::ModulePublishFailure {
+            error: "No modules found in the package".to_string(),
+        }
+        .into());
+    }
+
     compiled_package
         .package
         .compiled_package_info
@@ -2035,7 +2045,9 @@ pub(crate) async fn compile_package(
 
 /// Return the correct implicit dependencies for the [version], producing a warning or error if the
 /// protocol version is unknown or old
-fn implicit_deps_for_protocol_version(version: ProtocolVersion) -> anyhow::Result<Dependencies> {
+pub(crate) fn implicit_deps_for_protocol_version(
+    version: ProtocolVersion,
+) -> anyhow::Result<Dependencies> {
     if version > ProtocolVersion::MAX + 2 {
         eprintln!(
             "[{}]: The network is using protocol version {:?}, but this binary only recognizes protocol version {:?}; \
