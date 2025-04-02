@@ -3059,11 +3059,20 @@ pub(crate) async fn dry_run_or_execute_or_serialize(
             tx_data,
         ))
     } else {
-        let signature = context.config.keystore.sign_secure(
+        let signature = match context.config.keystore.sign_secure(
             &tx_data.sender(),
             &tx_data,
             Intent::sui_transaction(),
-        )?;
+        ) {
+            Ok(sig) => sig,
+            Err(_) => {
+                context.config.encryptedkeystore.sign_secure(
+                    &tx_data.sender(),
+                    &tx_data,
+                    Intent::sui_transaction(),
+                )?
+            }
+        };
 
         let sender_signed_data = SenderSignedData::new_from_sender_signature(tx_data, signature);
         if serialize_signed_transaction {
