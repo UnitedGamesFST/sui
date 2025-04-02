@@ -28,6 +28,7 @@ use std::num::NonZeroU32;
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, NONCE_LEN};
 use ring::pbkdf2;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use zeroize::Zeroize;
 
 // Encryption-related constants
 const PBKDF2_ITERATIONS: u32 = 100_000;
@@ -116,8 +117,7 @@ pub fn decrypt_key_pair(encrypted_data: &EncryptedKeyData, password: &str) -> Re
             .map_err(|e| anyhow!("Failed to restore keypair: {}", e))
     };
     
-    // Zero out sensitive data from memory
-    derived_key.iter_mut().for_each(|b| *b = 0);
+    derived_key.zeroize();
     
     result
 }
@@ -232,6 +232,11 @@ fn create_encrypt_key_data(
         public_key: keypair.public().encode_base64(),
         ciphertext: BASE64.encode(&serialized_data),
     };
+    
+    derived_key.zeroize();
+    let mut cleared_string = serialized_keypair;
+    cleared_string.zeroize();
+    serialized_data.zeroize();
     
     Ok(encrypted_data)
 }

@@ -22,6 +22,7 @@ regex.workspace = true
 ring = "0.17.0"
 base64 = "0.21.0"
 rpassword.workspace = true
+zeroize = "1.5.7"
 
 [dev-dependencies]
 tempfile.workspace = true
