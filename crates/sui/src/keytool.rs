@@ -1003,8 +1003,21 @@ impl KeyToolCommand {
                 let mut hasher = DefaultHash::default();
                 hasher.update(bcs::to_bytes(&intent_msg)?);
                 let digest = hasher.finalize().digest;
-                let sui_signature =
-                    keystore.sign_secure(&address, &intent_msg.value, intent_msg.intent)?;
+
+                let sui_signature = if keystore.addresses().contains(&address) {
+                    keystore.sign_secure(
+                        &address,
+                        &intent_msg.value,
+                        intent_msg.intent,
+                    )?
+                } else {
+                    encrypted_keystore.sign_secure(
+                        &address,
+                        &intent_msg.value,
+                        intent_msg.intent,
+                    )?
+                };
+
                 CommandOutput::Sign(SignData {
                     sui_address: address,
                     raw_tx_data: data,

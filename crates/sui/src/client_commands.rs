@@ -3068,21 +3068,20 @@ pub(crate) async fn dry_run_or_execute_or_serialize(
             tx_data,
         ))
     } else {
-        let signature = match context.config.keystore.sign_secure(
-            &tx_data.sender(),
-            &tx_data,
-            Intent::sui_transaction(),
-        ) {
-            Ok(sig) => sig,
-            Err(_) => {
-                context.config.encrypted_keystore.as_ref()
-                .ok_or_else(|| anyhow!("No encrypted keystore found"))?
-                .sign_secure(
-                    &tx_data.sender(),
-                    &tx_data,
-                    Intent::sui_transaction(),
-                )?
-            }
+        let signature = if context.config.keystore.addresses().contains(&tx_data.sender()) {
+            context.config.keystore.sign_secure(
+                &tx_data.sender(),
+                &tx_data,
+                Intent::sui_transaction(),
+            )?
+        } else if let Some(encrypted_store) = &context.config.encrypted_keystore {
+            encrypted_store.sign_secure(
+                &tx_data.sender(),
+                &tx_data,
+                Intent::sui_transaction(),
+            )?
+        } else{
+            return Err(anyhow!("No keystore found"))
         };
 
         let sender_signed_data = SenderSignedData::new_from_sender_signature(tx_data, signature);
