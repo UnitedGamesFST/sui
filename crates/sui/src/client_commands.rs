@@ -791,6 +791,15 @@ impl SuiClientCommands {
                     .into_iter()
                     .map(|(address, alias)| (alias.alias.to_string(), *address))
                     .collect();
+                if let Some(encrypted_keystore) = &context.config.encrypted_keystore {
+                    let encrypted_addresses = encrypted_keystore
+                        .addresses_with_alias()
+                        .into_iter()
+                        .map(|(address, alias)| (format!("{} (encrypted)", alias.alias), *address));
+                    
+                    addresses.extend(encrypted_addresses);
+                }
+
                 if sort_by_alias {
                     addresses.sort();
                 }
