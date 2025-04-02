@@ -3066,7 +3066,9 @@ pub(crate) async fn dry_run_or_execute_or_serialize(
         ) {
             Ok(sig) => sig,
             Err(_) => {
-                context.config.encryptedkeystore.sign_secure(
+                context.config.encrypted_keystore.as_ref()
+                .ok_or_else(|| anyhow!("No encrypted keystore found"))?
+                .sign_secure(
                     &tx_data.sender(),
                     &tx_data,
                     Intent::sui_transaction(),
