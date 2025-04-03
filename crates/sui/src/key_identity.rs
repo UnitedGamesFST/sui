@@ -59,19 +59,7 @@ pub fn get_identity_address_from_keystore(
     encrypted_keystore: Option<&EncryptedKeystore>,
 ) -> Result<SuiAddress, Error> {
     match input {
-        KeyIdentity::Address(x) => {
-            if keystore.addresses().contains(&x) {
-                return Ok(x);
-            }
-            
-            if let Some(encrypted_keystore) = encrypted_keystore {
-                if encrypted_keystore.addresses().contains(&x) {
-                    return Ok(x);
-                }
-            }
-            
-            Err(anyhow::anyhow!("Address {} not managed by wallet", x))
-        },
+        KeyIdentity::Address(x) => Ok(x),
         KeyIdentity::Alias(x) => {
             match keystore.get_address_by_alias(x.clone()) {
                 Ok(address) => Ok(*address),
