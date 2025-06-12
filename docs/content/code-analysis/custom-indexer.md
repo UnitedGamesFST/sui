@@ -139,9 +139,9 @@ graph LR;
 
 ### 3.1 Config 로드
 serde_yaml + sui_config::Config 트레이트로 YAML 파일 혹은 ENV 로드 지원
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/config.rs#L1-L12)
 
 ```rust
-// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/config.rs#L1-L12
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -160,9 +160,9 @@ fn default_db_url() -> String {
 ```
 ### 3.2 트레이싱 & 로깅
 telemetry-subscribers를 사용해 로깅 레이어 초기화
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/main.rs#L5-L10)
 
 ```rust
-// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/main.rs#L5-L10
 use telemetry_subscribers::TelemetryConfig;
 
 let telemetry = TelemetryConfig::new()
@@ -173,9 +173,9 @@ tracing::info!("Telemetry initialized");
 ```
 ### 3.3 Metrics 서버
 mysten_metrics::start_prometheus_server로 Prometheus metrics 서버 기동
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/main.rs#L12-L16)
 
 ```rust
-// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/main.rs#L12-L16
 use mysten_metrics::start_prometheus_server;
 
 let metrics_address =
@@ -187,18 +187,18 @@ tracing::info!("Metrics server started at port {}", config.metric_port);
 ```
 ### 3.4 ProgressStore
 FileProgressStore로 로컬 파일 기반 진척도 저장
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-data-ingestion-core/src/progress_store.rs#L1-L20)
 
 ```rust
-// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-data-ingestion-core/src/progress_store.rs#L1-L20
 use sui_data_ingestion_core::FileProgressStore;
 
 let progress_store = FileProgressStore::new(PathBuf::from(config.progress_file_path));
 ```
 ### 3.5 Ingestion Core
 setup_single_workflow으로 체크포인트 파이프라인 구성
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-data-ingestion-core/src/executor.rs#L56-L73)
 
 ```rust
-// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-data-ingestion-core/src/executor.rs#L56-L73
 pub async fn setup_single_workflow<W: Worker + 'static>(
     progress_store: impl ProgressStore + Clone,
     concurrency: usize,
@@ -209,9 +209,9 @@ pub async fn setup_single_workflow<W: Worker + 'static>(
 ```
 ### 3.6 도메인 워커
 async_trait 기반 도메인 워커 구현
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/suins-indexer/src/main.rs#L43-L66)
 
 ```rust
-// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/suins-indexer/src/main.rs#L43-L66
 #[async_trait]
 impl Worker for SuinsIndexerWorker {
     type Result = ();
@@ -223,9 +223,9 @@ impl Worker for SuinsIndexerWorker {
 ```
 ### 3.7 Persistence
 diesel_async를 사용한 PostgreSQL 연결 풀 관리
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/postgres_manager.rs#L1-L18)
 
 ```rust
-// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/postgres_manager.rs#L1-L18
 use diesel_async::pooled_connection::bb8::{Pool, AsyncDieselConnectionManager};
 
 pub fn get_connection_pool(db_url: String) -> Pool<AsyncDieselConnectionManager<AsyncPgConnection>> {
@@ -239,9 +239,9 @@ pub fn get_connection_pool(db_url: String) -> Pool<AsyncDieselConnectionManager<
 
 ### 4.1 DeepBook Indexer
 IndexerBuilder를 사용해 백필 및 실시간 파이프라인 구성
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/main.rs#L91-L101)
 
 ```rust
-// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/main.rs#L91-L101
 let indexer = IndexerBuilder::new(
     "SuiDeepBookIndexer",
     sui_checkpoint_datasource,
@@ -253,10 +253,9 @@ indexer.start().await?;
 ```
 ### 4.2 Suins Indexer
 IndexerExecutor와 WorkerPool을 통한 Suins 인덱싱
-GitHub: https://github.com/MystenLabs/sui/blob/main/crates/suins-indexer/src/main.rs#L158-L166
+[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/suins-indexer/src/main.rs#L158-L166)
 
 ```rust
-//GitHub: https://github.com/MystenLabs/sui/blob/main/crates/suins-indexer/src/main.rs#L158-L166
 let mut executor = IndexerExecutor::new(progress_store, 1, metrics);
 let worker_pool = WorkerPool::new(
     SuinsIndexerWorker { /* ... */ },
@@ -274,32 +273,186 @@ executor.run(
 ```
 ### 4.3 Indexer Builder 크레이트
 제네릭 Datasource, DataMapper, Persistent 인터페이스 제공
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-indexer-builder/src/indexer_builder.rs#L10-L17)
 
 ```rust
-// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-indexer-builder/src/indexer_builder.rs#L10-L17
-pub struct IndexerBuilder<D, M, P> {
-    name: String,
-    datasource: D,
-    data_mapper: M,
-    persistent: P,
-    backfill_strategy: BackfillStrategy,
-    disable_live_task: bool,
-}
+pub struct IndexerBuilder<D, M, P> { ... }
+impl<D, M, P> IndexerBuilder<D, M, P> { pub fn new<R>(...) } // 생략
+```
 
-impl<D, M, P> IndexerBuilder<D, M, P> {
-    pub fn new<R>(
-        name: &str,
-        datasource: D,
-        data_mapper: M,
-        persistent: P,
-    ) -> IndexerBuilder<D, M, P>;
-    // ...
+---
+
+## 5. 내부 구조 심층 분석
+
+### 5.1 IndexerBuilder 흐름
+IndexerBuilder를 통해 태스크가 등록·갱신되고, 백필과 실시간 파이프라인이 기동되는 전 과정을 살펴봅니다.
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-indexer-builder/src/indexer_builder.rs#L22-L41)
+
+```rust
+impl<P, D, M> Indexer<P, D, M> {
+    pub async fn start<T, R>(mut self) -> Result<(), Error>
+    where
+        D: Datasource<T> + 'static,
+        M: DataMapper<T, R> + 'static,
+        P: Persistent<R> + 'static,
+        T: Send,
+    {
+        // 1. 태스크 목록 갱신
+        self.update_tasks().await?;
+        // 2. 실시간 태스크(start_checkpoint → LIVE)
+        if let Some(live) = ongoing.live_task() {
+            self.datasource
+                .start_ingestion_task(live, self.storage.clone(), self.data_mapper.clone())
+                .await?;
+        }
+        // 3. 백필 태스크 순차 실행
+        for task in ongoing.backfill_tasks_ordered_desc() {
+            if task.start_checkpoint < task.target_checkpoint {
+                self.datasource
+                    .start_ingestion_task(task, ...)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+### 5.2 DataMapper & Persistent 인터페이스
+도메인별 매핑과 영속화 로직이 분리된 구조를 확인합니다.
+
+#### DataMapper 트레이트 정의
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-indexer-builder/src/indexer_builder.rs#L561-L569)
+```rust
+pub trait DataMapper<T, R>: Sync + Send + Clone {
+    fn map(&self, data: T) -> Result<Vec<R>, anyhow::Error>;
+}
+```
+
+#### DeepBook DataMapper 구현 예시
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/sui_deepbook_indexer.rs#L363-L372)
+```rust
+#[derive(Clone)]
+pub struct SuiDeepBookDataMapper { metrics: DeepBookIndexerMetrics, package_id: ObjectID }
+impl DataMapper<CheckpointTxnData, ProcessedTxnData> for SuiDeepBookDataMapper {
+    fn map(&self, (data, cp, ts): CheckpointTxnData) -> Result<Vec<ProcessedTxnData>, Error> {
+        // 이벤트 필터링 → DB 타입 매핑 로직
+    }
+}
+```
+
+#### Persistent 트레이트 정의 및 구현
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-indexer-builder/src/indexer_builder.rs#L322-L330)
+```rust
+pub trait Persistent<T>: IndexerProgressStore + Sync + Send + Clone {
+    async fn write(&self, data: Vec<T>) -> Result<(), Error>;
+}
+```
+
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/sui_deepbook_indexer.rs#L14-L22)
+```rust
+#[derive(Clone)]
+pub struct PgDeepbookPersistent { pool: PgPool, save_progress_policy: ProgressSavingPolicy }
+#[async_trait]
+impl Persistent<ProcessedTxnData> for PgDeepbookPersistent {
+    async fn write(&self, data: Vec<ProcessedTxnData>) -> Result<(), Error> {
+        // 배치 분리 및 diesel 트랜잭션으로 일괄 쓰기
+    }
+}
+```
+
+### 5.3 ProgressStore 구현
+진척도 저장소의 추상화와 파일 기반 구현을 살펴봅니다.
+
+#### ProgressStore 트레이트 정의
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-data-ingestion-core/src/progress_store/mod.rs#L6-L13)
+```rust
+#[async_trait]
+pub trait ProgressStore: Send {
+    async fn load(&mut self, task_name: String) -> Result<u64>;
+    async fn save(&mut self, task_name: String, checkpoint: u64) -> Result<()>;
+}
+```
+
+#### FileProgressStore 구현
++[GitHub 예제](https://github.com/MystenLabs/sui/blob/main/crates/sui-data-ingestion-core/src/progress_store/file.rs#L1-L46)
+```rust
+pub struct FileProgressStore { path: PathBuf }
+#[async_trait]
+impl ProgressStore for FileProgressStore {
+    async fn load(&mut self, name: String) -> Result<u64> { /* JSON 읽기 */ }
+    async fn save(&mut self, name: String, cp: u64) -> Result<()> { /* JSON 쓰기 */ }
 }
 ```
 
 ---
 
-## 5. 결론
+## 6. 결론
+
+위 패턴은 다음을 보장합니다:
+
+1. **확장성**: 새로운 도메인 로직을 `Worker`로 간단 주입
+2. **재사용성**: 공통 인프라(CLI·Logging·Metrics·Ingest) 분리
+3. **운영 안정성**: ProgressStore·메트릭·Graceful Shutdown
+
+Sui 서비스 특화 인덱서를 구축할 때, 이 구조를 그대로 재사용하면 빠르고 견고한 파이프라인을 만들 수 있습니다.
+
+---
+
+## 7. DeepBook Indexer 파일별 분석
+Sui DeepBook Indexer 크레이트의 주요 파일과 역할을 살펴봅니다.
+
+### 7.1 config.rs
+설정 로딩: YAML 혹은 ENV를 통해 인덱서 설정을 정의하고 `Config::load`로 파싱합니다.
+[GitHub](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/config.rs)
+
+### 7.2 error.rs
+에러 타입 정의: 내부 오류를 표현하는 단순한 `DeepBookError` 열거형입니다.
+[GitHub](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/error.rs)
+
+### 7.3 lib.rs
+모듈 공개: 크레이트의 엔트리 포인트로, 주요 하위 모듈(`config`, `error`, `events` 등)을 선언합니다.
+[GitHub](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/lib.rs)
+
+### 7.4 events.rs
+Move 이벤트 타입 정의: 체결·취소·만료 등 DeepBook 관련 이벤트 구조체를 선언합니다.
+[GitHub](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/events.rs)
+
+### 7.5 main.rs
+진입점: 설정 로드, 트레이싱·메트릭 초기화, HTTP 서버 기동, 데이터 파이프라인 실행을 담당합니다.
+[GitHub](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/main.rs)
+
+### 7.6 metrics.rs
+지표 정의: Prometheus 레지스트리에 등록할 카운터·게이지를 선언하고 `IndexerMetricProvider`를 구현합니다.
+[GitHub](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/metrics.rs)
+
+### 7.7 models.rs
+데이터베이스 모델: Diesel ORM을 위한 `Queryable`·`Insertable` 구조체와 `Task` 변환 로직을 포함합니다.
+[GitHub](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/models.rs)
+
+### 7.8 postgres_manager.rs
+DB 연결 풀: `AsyncDieselConnectionManager` 기반의 Postgres 풀 생성 함수를 제공합니다.
+[GitHub](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/postgres_manager.rs)
+
+### 7.9 schema.rs
+Diesel 스키마: 자동 생성된 테이블 스키마 정의로, ORM 매핑에 사용됩니다.
+[GitHub](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/schema.rs)
+
+### 7.10 server.rs
+HTTP 서버 구현: Axum 기반 REST 엔드포인트 정의 및 라우터 생성 로직을 포함합니다.
+[GitHub](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/server.rs)
+
+### 7.11 sui_deepbook_indexer.rs
+인덱서 코어: `DataMapper`, `Persistent` 인터페이스 사용, 이벤트 처리→DB 매핑 파이프라인을 구현합니다.
+[GitHub](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/sui_deepbook_indexer.rs)
+
+### 7.12 types.rs
+도메인 타입: 체크포인트 원시 데이터와 매핑된 `ProcessedTxnData` 열거형 및 변환 헬퍼를 정의합니다.
+[GitHub](https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/types.rs)
+
+---
+
+## 8. 결론
 
 위 패턴은 다음을 보장합니다:
 
