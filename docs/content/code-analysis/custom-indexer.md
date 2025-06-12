@@ -138,10 +138,10 @@ graph LR;
 ## 3. 공통 컴포넌트
 
 ### 3.1 Config 로드
-- `serde_yaml` + `sui_config::Config` 트레이트로 YAML 파일 혹은 ENV 로드 지원
+serde_yaml + sui_config::Config 트레이트로 YAML 파일 혹은 ENV 로드 지원
 
 ```rust
-// crates/sui-deepbook-indexer/src/config.rs:1-12
+// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/config.rs#L1-L12
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -155,215 +155,144 @@ pub struct IndexerConfig {
 impl sui_config::Config for IndexerConfig {}
 
 fn default_db_url() -> String {
-    // ENV var DB_URL 또는 패닉
     env::var("DB_URL").expect("DB_URL must be set")
 }
 ```
-- `impl Config for IndexerConfig` 는 `Config::load(path)` 메서드를 제공하며, 내부적으로 `serde_yaml::from_reader` 를 호출합니다.
-
 ### 3.2 트레이싱 & 로깅
-- `telemetry-subscribers` 를 호출해 환경변수 기반 레벨 설정 및 로그 포맷 적용
+telemetry-subscribers를 사용해 로깅 레이어 초기화
 
 ```rust
-// main.rs:5-10
+// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/main.rs#L5-L10
 use telemetry_subscribers::TelemetryConfig;
 
-TelemetryConfig::new()
-    .with_env()   // RUST_LOG=debug 등 ENV 로깅 레벨 제어
-    .init();      // global subscriber 등록
+let telemetry = TelemetryConfig::new()
+    .with_env_filter()   // RUST_LOG 같은 ENV 읽기
+    .with_opentelemetry()// (선택) OTLP exporter
+    .init();
+tracing::info!("Telemetry initialized");
 ```
-- `.with_env()` 는 `RUST_LOG` 값에 따라 모듈별 로그 레벨을 조정하며, `.init()` 은 Tokio 트레이싱 구독자를 초기화합니다.
-
 ### 3.3 Metrics 서버
-- `mysten-metrics::start_prometheus_server` 로 HTTP 엔드포인트를 띄우고, 기본 레지스트리를 반환
+mysten_metrics::start_prometheus_server로 Prometheus metrics 서버 기동
 
 ```rust
-// main.rs:12-16
+// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/main.rs#L12-L16
 use mysten_metrics::start_prometheus_server;
-use prometheus::Registry;
 
-let metrics_addr = "0.0.0.0:9090".parse().unwrap();
-let registry_service = start_prometheus_server(metrics_addr);
-let registry: Registry = registry_service.default_registry();
-init_metrics(&registry);
+let metrics_address =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), config.metric_port);
+let registry_service = start_prometheus_server(metrics_address);
+let registry = registry_service.default_registry();
+mysten_metrics::init_metrics(&registry);
+tracing::info!("Metrics server started at port {}", config.metric_port);
 ```
-- `init_metrics` 는 기본 메트릭(채널 인플로우, 태스크 처리량 등)을 레지스트리에 등록합니다.
-
 ### 3.4 ProgressStore
-- 파일 기반(`FileProgressStore`) 또는 DB 기반(`Persistent`)
+FileProgressStore로 로컬 파일 기반 진척도 저장
 
 ```rust
-// Suins: FileProgressStore 사용 예
+// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-data-ingestion-core/src/progress_store.rs#L1-L20
 use sui_data_ingestion_core::FileProgressStore;
-use std::path::PathBuf;
 
-let progress_file = PathBuf::from("./progress.json");
-let store = FileProgressStore::new(progress_file);
+let progress_store = FileProgressStore::new(PathBuf::from(config.progress_file_path));
 ```
-- `FileProgressStore` 는 내부적으로 JSON 파일에 최근 처리된 체크포인트 번호를 저장하며, 재시작 시 해당 값부터 재개합니다.
-
 ### 3.5 Ingestion Core
-- `sui_data_ingestion_core::setup_single_workflow` 에서 워크플로우를 초기화합니다.
+setup_single_workflow으로 체크포인트 파이프라인 구성
 
 ```rust
-// crates/sui-data-ingestion-core/src/executor.rs:56-73
+// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-data-ingestion-core/src/executor.rs#L56-L73
 pub async fn setup_single_workflow<W: Worker + 'static>(
-    worker: W,
-    remote_store_url: String,
-    initial_checkpoint_number: CheckpointSequenceNumber,
+    progress_store: impl ProgressStore + Clone,
     concurrency: usize,
-    reader_options: Option<ReaderOptions>,
-) -> Result<(
-    impl Future<Output = Result<ExecutorProgress>>,
-    oneshot::Sender<()>,
-)> {
-    let (exit_sender, exit_receiver) = oneshot::channel();
-    let metrics = DataIngestionMetrics::new(&Registry::new());
-    let progress_store = ShimProgressStore(initial_checkpoint_number);
-    let mut executor = IndexerExecutor::new(progress_store, 1, metrics);
-    let worker_pool = WorkerPool::new(worker, "workflow".to_string(), concurrency);
-    executor.register(worker_pool).await?;
-    Ok((
-        executor.run(
-            tempfile::tempdir()?.into_path(),
-            Some(remote_store_url),
-            vec![],
-            reader_options.unwrap_or_default(),
-            exit_receiver,
-        ),
-        exit_sender,
-    ))
+    metrics: DataIngestionMetrics,
+) -> Result<(), anyhow::Error> {
+    // ...
 }
 ```
-- `IndexerExecutor::run` 내부:
-  1. `CheckpointReader::initialize` 로 로컬/원격 스토어에서 체크포인트를 읽는 태스크 기동
-  2. 각 `WorkerPool` 에 `CheckpointData` 채널로 브로드캐스트
-  3. `WorkerPool` 가 처리 완료 시 보내는 체크포인트 번호를 받아 `ProgressStore` 에 저장
-  4. 워터마크(최소 처리 시퀀스) 기반 GC 발신
-
-```rust
-// crates/sui-data-ingestion-core/src/executor.rs:92-114
-loop {
-    tokio::select! {
-        _ = &mut exit_receiver => break,
-        Some((task_name, seq)) = self.pool_progress_receiver.recv() => {
-            self.progress_store.save(task_name.clone(), seq).await?;
-            let min_watermark = self.progress_store.min_watermark()?;
-            gc_sender.send(min_watermark).await?;
-            self.metrics.data_ingestion_checkpoint.with_label_values(&[&task_name]).set(seq as i64);
-        }
-        Some(cp) = checkpoint_recv.recv() => {
-            for sender in &self.pool_senders {
-                sender.send(cp.clone()).await?;
-            }
-        }
-    }
-}
-```
-- `CheckpointReader`:
-  - `read_local_files` 로 로컬 디렉토리에서 `.chk` 파일 읽기
-  - `remote_fetch_checkpoint` 에서 객체 저장소/REST API로부터 백오프(retry)하며 읽기
-  - `DataLimiter` 로 동시 in-flight 체크포인트 용량 제한
-
 ### 3.6 도메인 워커
-- `Worker` 트레이트 구현부에서 실제 비즈니스 로직을 작성합니다.
+async_trait 기반 도메인 워커 구현
 
 ```rust
-// crates/suins-indexer/src/main.rs:43-66
+// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/suins-indexer/src/main.rs#L43-L66
 #[async_trait]
 impl Worker for SuinsIndexerWorker {
     type Result = ();
     async fn process_checkpoint(&self, checkpoint: &CheckpointData) -> Result<()> {
-        let seq = checkpoint.checkpoint_summary.sequence_number;
-        let (updates, removals) = self.indexer.process_checkpoint(checkpoint);
-        if seq % 1000 == 0 {
-            info!("Processed checkpoint {}", seq);
-        }
-        self.commit_to_db(&updates, &removals, seq).await?;
+        // 도메인 로직
         Ok(())
     }
 }
 ```
-- `commit_to_db`:
-  - Diesel `insert_into(...).on_conflict(...).do_update()` 로 **bulk upsert**
-  - `delete(...).filter(...).execute()` 로 **conditional 삭제**
-  - `connection.transaction` 으로 원자적 실행 보장
-
-```rust
-// crates/suins-indexer/src/main.rs:6-16
-connection.transaction::<_, anyhow::Error, _>(|conn| async move {
-    diesel::insert_into(domains::table)
-        .values(updates)
-        .on_conflict(domains::name)
-        .do_update()
-        .set((domains::expiration_timestamp_ms.eq(sql("...")),))
-        .execute(conn)
-        .await?;
-
-    diesel::delete(domains::table)
-        .filter(domains::field_id.eq_any(removals)
-            .and(domains::last_checkpoint_updated.le(seq as i64)))
-        .execute(conn)
-        .await?;
-    Ok(())
-}).await
-```
-- **성능 팁**: 대용량 업데이트 시 배치 크기, 인덱스 튜닝, 파티셔닝 고려
-
 ### 3.7 Persistence
-- `diesel_async` + `sui-pg-db::get_connection_pool`
+diesel_async를 사용한 PostgreSQL 연결 풀 관리
 
 ```rust
-// postgres_manager.rs
+// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/postgres_manager.rs#L1-L18
 use diesel_async::pooled_connection::bb8::{Pool, AsyncDieselConnectionManager};
-use diesel_async::AsyncPgConnection;
 
-pub async fn get_connection_pool(url: String) -> Pool<AsyncPgConnection> {
-    let mgr = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
-    Pool::builder().build(mgr).await.unwrap()
+pub fn get_connection_pool(db_url: String) -> Pool<AsyncDieselConnectionManager<AsyncPgConnection>> {
+    // ...
 }
 ```
-- DB 커넥션 풀을 생성한 후, 워커 내부에서 `pool.get().await` 으로 연결을 꺼내 쓰며, `transaction` 으로 안전하게 쓰기/삭제를 수행합니다.
 
 ---
 
 ## 4. 서비스별 특화 예시
 
 ### 4.1 DeepBook Indexer
-- **목표**: MVR(주문장) 상태를 MPS(메모리) → Parquet/SQL로 직렬화
-- **패턴**: `IndexerBuilder` 로 **백필 & 실시간** 작업 순서 제어
+IndexerBuilder를 사용해 백필 및 실시간 파이프라인 구성
 
 ```rust
-// main.rs
-IndexerBuilder::new(
-    "DeepBook",
-    SuiCheckpointDatasource::new(...),
-    SuiDeepBookDataMapper { ... },
-    PgDeepbookPersistent::new(...)
-).build().start().await?;
+// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-deepbook-indexer/src/main.rs#L91-L101
+let indexer = IndexerBuilder::new(
+    "SuiDeepBookIndexer",
+    sui_checkpoint_datasource,
+    SuiDeepBookDataMapper { /* ... */ },
+    datastore,
+)
+.build();
+indexer.start().await?;
 ```
-- Tasks 큐: Live Task + Backfill Task 자동 관리
-
 ### 4.2 Suins Indexer
-- **목표**: SuiNS 레코드 캐싱(upsert/delete)
-- **패턴**: 단순 `WorkerPool` + `FileProgressStore`
+IndexerExecutor와 WorkerPool을 통한 Suins 인덱싱
 
 ```rust
-let mut exec = IndexerExecutor::new(store, 1, metrics);
-let pool = WorkerPool::new(SuinsWorker{...}, "suins", 100);
-exec.register(pool).await?;
-exec.run(...).await?;
+GitHub: https://github.com/MystenLabs/sui/blob/main/crates/suins-indexer/src/main.rs#L158-L166
+let mut executor = IndexerExecutor::new(progress_store, 1, metrics);
+let worker_pool = WorkerPool::new(
+    SuinsIndexerWorker { /* ... */ },
+    "suins_indexing".to_string(),
+    100,
+);
+executor.register(worker_pool).await?;
+executor.run(
+    PathBuf::from(checkpoints_dir),
+    remote_storage,
+    vec![],
+    ReaderOptions::default(),
+    exit_receiver,
+).await?;
 ```
-- `commit_to_db` 에서 bulk SQL로 upsert & delete
-
 ### 4.3 Indexer Builder 크레이트
-- 제네릭 `Datasource`, `DataMapper`, `Persistent` 인터페이스 제공
-- 백필·실시간 병합, Task 등록·갱신 로직 포함
+제네릭 Datasource, DataMapper, Persistent 인터페이스 제공
 
 ```rust
-pub struct IndexerBuilder<D, M, P> { ... }
-impl<D,M,P> IndexerBuilder<D,M,P> {
-    pub fn start(self) { ... }
+// GitHub: https://github.com/MystenLabs/sui/blob/main/crates/sui-indexer-builder/src/indexer_builder.rs#L10-L17
+pub struct IndexerBuilder<D, M, P> {
+    name: String,
+    datasource: D,
+    data_mapper: M,
+    persistent: P,
+    backfill_strategy: BackfillStrategy,
+    disable_live_task: bool,
+}
+
+impl<D, M, P> IndexerBuilder<D, M, P> {
+    pub fn new<R>(
+        name: &str,
+        datasource: D,
+        data_mapper: M,
+        persistent: P,
+    ) -> IndexerBuilder<D, M, P>;
+    // ...
 }
 ```
 
