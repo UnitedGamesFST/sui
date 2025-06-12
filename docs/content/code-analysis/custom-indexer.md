@@ -253,9 +253,10 @@ indexer.start().await?;
 ```
 ### 4.2 Suins Indexer
 IndexerExecutor와 WorkerPool을 통한 Suins 인덱싱
+GitHub: https://github.com/MystenLabs/sui/blob/main/crates/suins-indexer/src/main.rs#L158-L166
 
 ```rust
-GitHub: https://github.com/MystenLabs/sui/blob/main/crates/suins-indexer/src/main.rs#L158-L166
+//GitHub: https://github.com/MystenLabs/sui/blob/main/crates/suins-indexer/src/main.rs#L158-L166
 let mut executor = IndexerExecutor::new(progress_store, 1, metrics);
 let worker_pool = WorkerPool::new(
     SuinsIndexerWorker { /* ... */ },
