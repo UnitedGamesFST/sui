@@ -18,6 +18,8 @@ itertools.workspace = true
 move-command-line-common.workspace = true
 move-core-types.workspace = true
 move-package.workspace = true
+once_cell.workspace = true
+path-clean.workspace = true
 petgraph.workspace = true
 regex.workspace = true
 serde.workspace = true
@@ -32,9 +34,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+test-log.workspace = true
 datatest-stable.workspace = true
 insta.workspace = true
 tempfile.workspace = true
+walkdir.workspace = true
 
 [[bin]]
 name = "mock-resolver"
